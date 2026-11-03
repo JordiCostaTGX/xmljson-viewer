@@ -1,0 +1,5 @@
+The PNG is the top-right icon cropped from the image supplied by the user
+and selected explicitly as the XML/JSON viewer icon.
+It is not the earlier generated Viso robot and has no accompanying SVG.
+The original image's licensing/provenance beyond the user's supplied image
+has not been independently verified.

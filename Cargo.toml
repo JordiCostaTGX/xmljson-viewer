@@ -1,0 +1,26 @@
+[package]
+name = "xmljson-viewer-rust"
+version = "0.1.0"
+edition = "2024"
+description = "Independent GTK4 XML/JSON editor with a lazy tree"
+include = [
+    "/Cargo.toml", "/Cargo.lock", "/README.md", "/build.rs", "/install.sh",
+    "/xmljson-viewer-rust.desktop", "/src/*.rs",
+    "/resources/icon-provenance.txt", "/resources/viewer.gresource.xml",
+    "/resources/visor-mascot.png", "/tools/*.py",
+]
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.10", features = ["v4_12"] }
+sourceview = { package = "sourceview5", version = "0.10" }
+quick-xml = "0.37"
+serde = "1"
+serde_json = "1"
+html-escape = "0.2"
+regex = "1"
+
+[profile.release]
+strip = true
+
+[profile.dev]
+debug = 0

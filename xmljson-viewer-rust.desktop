@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Name=XML/JSON Viewer Rust
+Comment=Independent XML and JSON editor written in Rust
+Exec=xmljson-viewer-rust %F
+Icon=xmljson-viewer-rust
+Terminal=false
+Type=Application
+Categories=Utility;TextEditor;
+StartupNotify=true

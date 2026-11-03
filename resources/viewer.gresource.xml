@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/io/github/xmljsonviewer/Viewer/icons">
+    <file alias="256x256/apps/xmljson-viewer-rust.png">visor-mascot.png</file>
+    <file alias="256x256/apps/io.github.xmljsonviewer.Viewer.png">visor-mascot.png</file>
+  </gresource>
+</gresources>
