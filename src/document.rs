@@ -20,13 +20,6 @@ impl Kind {
             Self::Json
         }
     }
-
-    pub fn language(self) -> &'static str {
-        match self {
-            Self::Xml => "xml",
-            Self::Json => "json",
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -71,7 +64,6 @@ pub struct Node {
 
 #[derive(Debug)]
 pub struct Document {
-    pub text: Arc<str>,
     pub nodes: Vec<Node>,
     pub roots: Arc<[usize]>,
 }
@@ -137,8 +129,8 @@ impl Builder {
         Ok(id)
     }
 
-    fn finish(mut self, text: Arc<str>) -> Result<Document, String> {
-        // One linear UTF-8 pass maps all byte ranges to GTK character offsets.
+    fn finish(mut self, text: &str) -> Result<Document, String> {
+        // One linear UTF-8 pass maps all byte ranges to editor character offsets.
         let mut endpoints: Vec<(usize, usize, bool)> = self
             .nodes
             .iter()
@@ -166,7 +158,6 @@ impl Builder {
             node.children = children.into();
         }
         Ok(Document {
-            text,
             nodes: self.nodes,
             roots: self.roots.into(),
         })
@@ -175,7 +166,7 @@ impl Builder {
 
 pub fn parse(text: Arc<str>, kind: Kind, cancelled: impl Fn() -> bool) -> Result<Document, String> {
     if text.len() > i32::MAX as usize {
-        return Err("Document too large for GTK".into());
+        return Err("Document too large for the editor".into());
     }
     match kind {
         Kind::Json => parse_json(text, &cancelled),
@@ -184,17 +175,19 @@ pub fn parse(text: Arc<str>, kind: Kind, cancelled: impl Fn() -> bool) -> Result
 }
 
 fn parse_json(text: Arc<str>, cancelled: &impl Fn() -> bool) -> Result<Document, String> {
-    let mut deserializer = serde_json::Deserializer::from_str(&text);
+    // Windows tools often save UTF-8 with a byte order mark.
+    let start = text.len() - text.trim_start_matches('\u{feff}').len();
+    let mut deserializer = serde_json::Deserializer::from_str(&text[start..]);
     serde::de::IgnoredAny::deserialize(&mut deserializer).map_err(|e| format!("JSON: {e}"))?;
     deserializer.end().map_err(|e| format!("JSON: {e}"))?;
     let mut parser = JsonScanner {
         text: &text,
-        offset: 0,
+        offset: start,
         builder: Builder::new(),
         cancelled,
     };
     parser.value("root", None, None)?;
-    parser.builder.finish(text.clone())
+    parser.builder.finish(&text)
 }
 
 struct JsonScanner<'a, F> {
@@ -407,7 +400,7 @@ fn parse_xml(text: Arc<str>, cancelled: &impl Fn() -> bool) -> Result<Document, 
     if builder.roots.is_empty() {
         return Err("XML: no elements found".into());
     }
-    builder.finish(text)
+    builder.finish(&text)
 }
 
 pub fn format(text: &str, kind: Kind) -> Result<String, String> {
@@ -570,18 +563,14 @@ fn decode_content(raw: &str) -> Result<Option<(String, Option<Kind>)>, String> {
     }
     for kind in [Kind::Json, Kind::Xml] {
         for candidate in &candidates {
-            if let Ok(value) = format(candidate, kind) {
-                if value != text {
-                    return Ok(Some((value, Some(kind))));
-                }
+            if let Ok(value) = format(candidate, kind)
+                && value != text
+            {
+                return Ok(Some((value, Some(kind))));
             }
         }
     }
-    Ok(candidates
-        .into_iter()
-        .skip(1)
-        .next()
-        .map(|value| (value, None)))
+    Ok(candidates.into_iter().nth(1).map(|value| (value, None)))
 }
 
 #[cfg(test)]
@@ -676,5 +665,13 @@ mod tests {
     #[test]
     fn cancellation_is_reported() {
         assert!(parse(Arc::from("[1,2]"), Kind::Json, || true).is_err());
+    }
+
+    #[test]
+    fn json_with_byte_order_mark_keeps_character_offsets() {
+        let text = "\u{feff}{\"a\":1}";
+        let doc = parsed(text, Kind::Json);
+        assert_eq!(doc.nodes[0].chars, 1..8);
+        assert_eq!(&text[doc.nodes[1].range.clone()], "\"a\":1");
     }
 }

@@ -1,11 +1,14 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod document;
+mod editor;
 mod syntax;
 mod tree;
 mod tree_style;
 mod ui;
 
 use document::Kind;
-use std::{sync::Arc, time::Instant};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -16,7 +19,11 @@ fn main() {
         }
         return;
     }
-    ui::run();
+    let files = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    if let Err(error) = ui::run(files) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
 }
 
 fn benchmark(args: &[String]) -> Result<(), String> {
@@ -48,20 +55,19 @@ fn benchmark(args: &[String]) -> Result<(), String> {
         nodes,
         iterations,
         start.elapsed().as_secs_f64() * 1000.0 / iterations as f64,
-        peak_rss_kib()?
+        peak_rss_kib().map_or("n/a".into(), |kib| kib.to_string())
     );
     Ok(())
 }
 
-fn peak_rss_kib() -> Result<u64, String> {
-    let status = std::fs::read_to_string("/proc/self/status").map_err(|e| e.to_string())?;
-    status
+/// Linux only; other platforms report "n/a".
+fn peak_rss_kib() -> Option<u64> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()?
         .lines()
-        .find_map(|line| line.strip_prefix("VmHWM:"))
-        .ok_or_else(|| "Cannot measure VmHWM".to_string())?
+        .find_map(|line| line.strip_prefix("VmHWM:"))?
         .split_whitespace()
-        .next()
-        .ok_or("Empty VmHWM")?
+        .next()?
         .parse()
-        .map_err(|e| format!("Invalid VmHWM: {e}"))
+        .ok()
 }

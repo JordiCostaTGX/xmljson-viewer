@@ -1,74 +1,31 @@
 use crate::document::{LabelStyle, ValueStyle};
-use gtk::{gdk, pango};
+use eframe::egui::{
+    Color32, FontId,
+    text::{LayoutJob, LayoutSection, TextFormat},
+};
 use std::ops::Range;
 
-const KEY: (u16, u16, u16) = (0x9c9c, 0xdcdc, 0xfefe);
-const STRING: (u16, u16, u16) = (0xcece, 0x9191, 0x7878);
-const NUMBER: (u16, u16, u16) = (0xb5b5, 0xcece, 0xa8a8);
-const LITERAL: (u16, u16, u16) = (0x8282, 0xb8b8, 0xefef);
-const ATTRIBUTE: (u16, u16, u16) = (0xc5c5, 0xa5a5, 0xefef);
-const MUTED: (u16, u16, u16) = (0xabab, 0xb2b2, 0xbfbf);
+pub const BACKGROUND: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x1e);
+pub const HOVER: Color32 = Color32::from_rgb(0x29, 0x2d, 0x36);
+pub const SELECTED: Color32 = Color32::from_rgb(0x25, 0x32, 0x47);
+pub const EXPANDER: Color32 = KEY;
+const KEY: Color32 = Color32::from_rgb(0x9c, 0xdc, 0xfe);
+const STRING: Color32 = Color32::from_rgb(0xce, 0x91, 0x78);
+const NUMBER: Color32 = Color32::from_rgb(0xb5, 0xce, 0xa8);
+const LITERAL: Color32 = Color32::from_rgb(0x82, 0xb8, 0xef);
+const ATTRIBUTE: Color32 = Color32::from_rgb(0xc5, 0xa5, 0xef);
+const MUTED: Color32 = Color32::from_rgb(0xab, 0xb2, 0xbf);
 
-const CSS: &str = r#"
-listview.document-tree {
-    background-color: #1e1e1e;
-    color: #abb2bf;
-}
-listview.document-tree > row {
-    padding: 4px 6px;
-    border-radius: 4px;
-    background-color: transparent;
-}
-listview.document-tree > row:hover {
-    background-color: #292d36;
-}
-listview.document-tree > row:selected,
-listview.document-tree > row:selected:hover {
-    background-color: #253247;
-    color: #abb2bf;
-}
-listview.document-tree > row:focus-visible {
-    outline: 2px solid #82b8ef;
-    outline-offset: -2px;
-}
-listview.document-tree .tree-node-label {
-    font-family: monospace;
-}
-listview.document-tree treeexpander expander {
-    color: #9cdcfe;
-}
-"#;
-
-pub fn install(display: &gdk::Display) {
-    let provider = gtk::CssProvider::new();
-    provider.load_from_data(CSS);
-    gtk::style_context_add_provider_for_display(
-        display,
-        &provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
-}
-
-fn foreground(attrs: &pango::AttrList, range: Range<u32>, (red, green, blue): (u16, u16, u16)) {
-    if range.is_empty() {
-        return;
-    }
-    let mut attr = pango::AttrColor::new_foreground(red, green, blue);
-    attr.set_start_index(range.start);
-    attr.set_end_index(range.end);
-    attrs.change(attr);
-}
-
-pub fn attributes(text: &str, style: Option<&LabelStyle>) -> pango::AttrList {
-    let attrs = pango::AttrList::new();
-    let end = text.len() as u32;
-    foreground(&attrs, 0..end, MUTED);
+/// Colors per byte range; later ranges override earlier ones.
+fn colors(text: &str, style: Option<&LabelStyle>) -> Vec<(Range<usize>, Color32)> {
+    let end = text.len();
+    let mut colors = vec![(0..end, MUTED)];
     match style {
         Some(LabelStyle::Json { key_end, value }) => {
             let start = match key_end {
                 Some(key_end) => {
-                    foreground(&attrs, 0..*key_end, KEY);
-                    *key_end + 2
+                    colors.push((0..*key_end as usize, KEY));
+                    *key_end as usize + 2
                 }
                 None => 0,
             };
@@ -78,22 +35,51 @@ pub fn attributes(text: &str, style: Option<&LabelStyle>) -> pango::AttrList {
                 ValueStyle::Number => NUMBER,
                 ValueStyle::Literal => LITERAL,
             };
-            foreground(&attrs, start..end, color);
+            colors.push((start.min(end)..end, color));
         }
         Some(LabelStyle::Xml {
             element_end,
             attributes,
         }) => {
-            foreground(&attrs, 1..*element_end, KEY);
+            colors.push((1..*element_end as usize, KEY));
             for attribute in attributes.iter() {
-                foreground(&attrs, attribute.name.clone(), ATTRIBUTE);
-                foreground(&attrs, attribute.value.clone(), STRING);
+                colors.push((
+                    attribute.name.start as usize..attribute.name.end as usize,
+                    ATTRIBUTE,
+                ));
+                colors.push((
+                    attribute.value.start as usize..attribute.value.end as usize,
+                    STRING,
+                ));
             }
         }
-        Some(LabelStyle::Text) => foreground(&attrs, 0..end, STRING),
+        Some(LabelStyle::Text) => colors.push((0..end, STRING)),
         Some(LabelStyle::Plain) | None => {}
     }
-    attrs
+    colors
+}
+
+pub fn job(text: &str, style: Option<&LabelStyle>, font: FontId) -> LayoutJob {
+    let mut per_byte = vec![MUTED; text.len()];
+    for (range, color) in colors(text, style) {
+        per_byte[range].fill(color);
+    }
+    let mut job = LayoutJob {
+        text: text.into(),
+        ..Default::default()
+    };
+    let mut start = 0;
+    for at in 1..=text.len() {
+        if at == text.len() || per_byte[at] != per_byte[start] {
+            job.sections.push(LayoutSection {
+                leading_space: 0.0,
+                byte_range: start.into()..at.into(),
+                format: TextFormat::simple(font.clone(), per_byte[start]),
+            });
+            start = at;
+        }
+    }
+    job
 }
 
 #[cfg(test)]
@@ -101,6 +87,13 @@ mod tests {
     use super::*;
     use crate::document::{self, Kind};
     use std::sync::Arc;
+
+    fn sections(job: &LayoutJob) -> Vec<(Range<usize>, Color32)> {
+        job.sections
+            .iter()
+            .map(|s| (s.byte_range.start.0..s.byte_range.end.0, s.format.color))
+            .collect()
+    }
 
     #[test]
     fn json_styles_use_real_types_and_utf8_key_boundaries() {
@@ -134,8 +127,15 @@ mod tests {
                 ..
             }
         ));
-        let _ = attributes(&doc.nodes[1].label, Some(&doc.nodes[1].label_style));
-        assert!(doc.nodes[1].label.contains("<span foreground='red'>"));
+        let label = &doc.nodes[1].label;
+        let job = job(
+            label,
+            Some(&doc.nodes[1].label_style),
+            FontId::monospace(13.0),
+        );
+        assert_eq!(job.text, *label);
+        assert_eq!(sections(&job)[0], (0.."é:😀".len(), KEY));
+        assert_eq!(sections(&job).last().unwrap().1, STRING);
     }
 
     #[test]
@@ -163,6 +163,13 @@ mod tests {
         );
         assert!(matches!(doc.nodes[1].label_style, LabelStyle::Text));
         assert!(matches!(doc.nodes[2].label_style, LabelStyle::Text));
+        let job = job(
+            &node.label,
+            Some(&node.label_style),
+            FontId::monospace(13.0),
+        );
+        let total: usize = sections(&job).iter().map(|s| s.0.len()).sum();
+        assert_eq!(total, node.label.len());
     }
 
     #[test]
@@ -179,28 +186,34 @@ mod tests {
                 ..
             }
         ));
-        let attrs = attributes(&doc.nodes[1].label, Some(&doc.nodes[1].label_style));
-        let mut iterator = attrs.iterator();
-        assert_eq!(iterator.range(), (0, 2));
-        assert!(iterator.next_style_change());
-        assert_eq!(iterator.range(), (2, 6));
-        assert_eq!(attributes("Items 1–512", None).iterator().attrs().len(), 1);
+        let styled = job(
+            &doc.nodes[1].label,
+            Some(&doc.nodes[1].label_style),
+            FontId::monospace(13.0),
+        );
+        assert_eq!(sections(&styled), [(0..2, MUTED), (2..6, LITERAL)]);
+        assert_eq!(
+            job("Items 1–512", None, FontId::monospace(13.0))
+                .sections
+                .len(),
+            1
+        );
     }
 
     #[test]
     fn palette_contrast_remains_readable_on_selected_rows() {
-        fn luminance((r, g, b): (u16, u16, u16)) -> f64 {
-            fn linear(value: u16) -> f64 {
-                let value = f64::from(value) / 65535.0;
+        fn luminance(color: Color32) -> f64 {
+            fn linear(value: u8) -> f64 {
+                let value = f64::from(value) / 255.0;
                 if value <= 0.04045 {
                     value / 12.92
                 } else {
                     ((value + 0.055) / 1.055).powf(2.4)
                 }
             }
-            0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+            0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
         }
-        let selected = luminance((0x2525, 0x3232, 0x4747));
+        let selected = luminance(SELECTED);
         for color in [KEY, STRING, NUMBER, LITERAL, ATTRIBUTE, MUTED] {
             assert!((luminance(color) + 0.05) / (selected + 0.05) >= 4.5);
         }

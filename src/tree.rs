@@ -1,153 +1,388 @@
-use crate::document::Document;
-use gtk::{gio, glib, prelude::*, subclass::prelude::*};
-use std::{cell::RefCell, collections::HashMap, sync::Arc};
+use crate::{document::Document, tree_style};
+use eframe::egui::{
+    Color32, EventFilter, FontId, Id, Key, Modifiers, ScrollArea, Sense, Shape, Stroke, Ui, pos2,
+    vec2,
+};
+use std::{borrow::Cow, collections::HashSet, sync::Arc};
 
-#[derive(Clone)]
-pub struct NodeRef {
-    pub document: Arc<Document>,
-    pub id: usize,
-    pub group: Option<Arc<[usize]>>,
-    pub label: String,
+/// Branches with more children than this are split into expandable blocks.
+pub const GROUP: usize = 512;
+const INDENT: f32 = 14.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RowKey {
+    Node(usize),
+    Group { parent: Option<usize>, index: usize },
 }
 
-mod imp {
+pub struct Row {
+    pub key: RowKey,
+    pub depth: usize,
+}
+
+#[derive(Default)]
+pub struct Tree {
+    document: Option<Arc<Document>>,
+    expanded: HashSet<RowKey>,
+    pub rows: Vec<Row>,
+    pub selected: Option<RowKey>,
+    scroll_to: Option<usize>,
+    keep_visible: Option<usize>,
+}
+
+fn ids(document: &Document, parent: Option<usize>) -> &[usize] {
+    match parent {
+        Some(parent) => &document.nodes[parent].children,
+        None => &document.roots,
+    }
+}
+
+fn level(document: &Document, parent: Option<usize>) -> Vec<RowKey> {
+    let ids = ids(document, parent);
+    if ids.len() > GROUP {
+        (0..ids.len().div_ceil(GROUP))
+            .map(|index| RowKey::Group { parent, index })
+            .collect()
+    } else {
+        ids.iter().map(|&id| RowKey::Node(id)).collect()
+    }
+}
+
+fn children(document: &Document, key: RowKey) -> Vec<RowKey> {
+    match key {
+        RowKey::Node(id) => level(document, Some(id)),
+        RowKey::Group { parent, index } => {
+            let ids = ids(document, parent);
+            ids[index * GROUP..((index + 1) * GROUP).min(ids.len())]
+                .iter()
+                .map(|&id| RowKey::Node(id))
+                .collect()
+        }
+    }
+}
+
+impl Tree {
+    pub fn set_document(&mut self, document: Arc<Document>) {
+        self.expanded.clear();
+        self.selected = None;
+        self.scroll_to = None;
+        self.keep_visible = None;
+        // Expand only the first root; deeper branches stay collapsed.
+        if let Some(&root) = document.roots.first() {
+            self.expanded.insert(RowKey::Node(root));
+        }
+        self.document = Some(document);
+        self.rebuild();
+    }
+
+    pub fn is_expanded(&self, key: RowKey) -> bool {
+        self.expanded.contains(&key)
+    }
+
+    pub fn expandable(&self, key: RowKey) -> bool {
+        match (key, &self.document) {
+            (RowKey::Node(id), Some(document)) => !document.nodes[id].children.is_empty(),
+            (RowKey::Group { .. }, _) => true,
+            _ => false,
+        }
+    }
+
+    pub fn toggle(&mut self, key: RowKey) {
+        if self.expandable(key) && !self.expanded.insert(key) {
+            self.expanded.remove(&key);
+        }
+        self.rebuild();
+    }
+
+    fn rebuild(&mut self) {
+        self.rows.clear();
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let mut stack: Vec<(RowKey, usize)> = level(&document, None)
+            .into_iter()
+            .rev()
+            .map(|key| (key, 0))
+            .collect();
+        while let Some((key, depth)) = stack.pop() {
+            self.rows.push(Row { key, depth });
+            if self.expanded.contains(&key) {
+                stack.extend(
+                    children(&document, key)
+                        .into_iter()
+                        .rev()
+                        .map(|child| (child, depth + 1)),
+                );
+            }
+        }
+    }
+
+    /// Expands the ancestors (and enclosing blocks) of a node, selects it and scrolls to it.
+    pub fn reveal(&mut self, id: usize, expand: bool) -> Option<usize> {
+        let document = self.document.clone()?;
+        let mut chain = vec![id];
+        let mut parent = document.nodes[id].parent;
+        while let Some(ancestor) = parent {
+            chain.push(ancestor);
+            parent = document.nodes[ancestor].parent;
+        }
+        chain.reverse();
+        for (depth, &node) in chain.iter().enumerate() {
+            let parent = document.nodes[node].parent;
+            let siblings = ids(&document, parent);
+            if siblings.len() > GROUP {
+                let position = siblings.iter().position(|&x| x == node).unwrap_or(0);
+                self.expanded.insert(RowKey::Group {
+                    parent,
+                    index: position / GROUP,
+                });
+            }
+            if (depth + 1 < chain.len() || expand) && !document.nodes[node].children.is_empty() {
+                self.expanded.insert(RowKey::Node(node));
+            }
+        }
+        self.rebuild();
+        self.selected = Some(RowKey::Node(id));
+        self.scroll_to = self.rows.iter().position(|row| row.key == RowKey::Node(id));
+        self.scroll_to
+    }
+
+    pub fn label(&self, key: RowKey) -> Cow<'_, str> {
+        match (key, &self.document) {
+            (RowKey::Node(id), Some(document)) => Cow::Borrowed(&document.nodes[id].label),
+            (RowKey::Group { parent, index }, Some(document)) => {
+                let total = ids(document, parent).len();
+                Cow::Owned(format!(
+                    "Items {}–{}",
+                    index * GROUP + 1,
+                    ((index + 1) * GROUP).min(total)
+                ))
+            }
+            _ => Cow::Borrowed(""),
+        }
+    }
+
+    fn select_row(&mut self, index: usize) -> Option<usize> {
+        let key = self.rows.get(index)?.key;
+        self.selected = Some(key);
+        self.keep_visible = Some(index);
+        match key {
+            RowKey::Node(id) => Some(id),
+            RowKey::Group { .. } => None,
+        }
+    }
+
+    fn keyboard(&mut self, ui: &Ui, id: Id) -> Option<usize> {
+        let ctx = ui.ctx();
+        if !ui.is_enabled() || !ctx.memory(|memory| memory.has_focus(id)) {
+            return None;
+        }
+        ctx.memory_mut(|memory| {
+            memory.set_focus_lock_filter(
+                id,
+                EventFilter {
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    ..Default::default()
+                },
+            )
+        });
+        let [up, down, left, right, toggle] = ctx.input_mut(|input| {
+            [
+                Key::ArrowUp,
+                Key::ArrowDown,
+                Key::ArrowLeft,
+                Key::ArrowRight,
+                Key::Enter,
+            ]
+            .map(|key| input.consume_key(Modifiers::NONE, key))
+        });
+        let current = self
+            .selected
+            .and_then(|key| self.rows.iter().position(|row| row.key == key));
+        let index = current.unwrap_or(0);
+        let key = self.rows.get(index)?.key;
+        if up {
+            return self.select_row(index.saturating_sub(1));
+        }
+        if down {
+            return self.select_row((index + 1).min(self.rows.len() - 1));
+        }
+        if toggle || (right && !self.is_expanded(key)) || (left && self.is_expanded(key)) {
+            self.toggle(key);
+            self.keep_visible = Some(index);
+        } else if left {
+            let depth = self.rows[index].depth;
+            if let Some(parent) = self.rows[..index]
+                .iter()
+                .rposition(|row| row.depth + 1 == depth)
+            {
+                return self.select_row(parent);
+            }
+        }
+        None
+    }
+
+    /// Returns the node chosen by the user, if any.
+    pub fn ui(&mut self, ui: &mut Ui, id: Id) -> Option<usize> {
+        ui.painter()
+            .rect_filled(ui.available_rect_before_wrap(), 0.0, tree_style::BACKGROUND);
+        // Rows have their own ids; this keeps keyboard focus on the tree itself.
+        ui.interact(
+            ui.available_rect_before_wrap(),
+            id,
+            Sense::focusable_noninteractive(),
+        );
+        let mut chosen = self.keyboard(ui, id);
+        let document = self.document.clone()?;
+        let font = FontId::monospace(13.0);
+        let row_height = ui.ctx().fonts_mut(|fonts| fonts.row_height(&font)) + 8.0;
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let mut area = ScrollArea::vertical().id_salt(id).auto_shrink(false);
+        if let Some(index) = self.scroll_to.take() {
+            let offset = index as f32 * row_height - ui.available_height() / 2.0;
+            area = area.vertical_scroll_offset(offset.max(0.0));
+        }
+        let enabled = ui.is_enabled();
+        let mut toggled = None;
+        area.show_rows(ui, row_height, self.rows.len(), |ui, range| {
+            for index in range {
+                let row = Row {
+                    key: self.rows[index].key,
+                    depth: self.rows[index].depth,
+                };
+                let (rect, response) =
+                    ui.allocate_exact_size(vec2(ui.available_width(), row_height), Sense::click());
+                if self.keep_visible == Some(index) {
+                    ui.scroll_to_rect(rect, None);
+                    self.keep_visible = None;
+                }
+                let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                let fade = |color: Color32| {
+                    if enabled {
+                        color
+                    } else {
+                        color.gamma_multiply(0.5)
+                    }
+                };
+                if self.selected == Some(row.key) {
+                    painter.rect_filled(rect, 4.0, tree_style::SELECTED);
+                } else if response.hovered() {
+                    painter.rect_filled(rect, 4.0, tree_style::HOVER);
+                }
+                let left = rect.left() + 6.0 + row.depth as f32 * INDENT;
+                let center = rect.center().y;
+                let expandable = self.expandable(row.key);
+                if expandable {
+                    let points = if self.is_expanded(row.key) {
+                        vec![
+                            pos2(left, center - 3.0),
+                            pos2(left + 8.0, center - 3.0),
+                            pos2(left + 4.0, center + 3.0),
+                        ]
+                    } else {
+                        vec![
+                            pos2(left + 2.0, center - 4.0),
+                            pos2(left + 7.0, center),
+                            pos2(left + 2.0, center + 4.0),
+                        ]
+                    };
+                    painter.add(Shape::convex_polygon(
+                        points,
+                        fade(tree_style::EXPANDER),
+                        Stroke::NONE,
+                    ));
+                }
+                let label = self.label(row.key);
+                let style = match row.key {
+                    RowKey::Node(node) => Some(&document.nodes[node].label_style),
+                    RowKey::Group { .. } => None,
+                };
+                let mut job = tree_style::job(&label, style, font.clone());
+                if !enabled {
+                    for section in &mut job.sections {
+                        section.format.color = fade(section.format.color);
+                    }
+                }
+                let galley = painter.layout_job(job);
+                painter.galley(
+                    pos2(left + INDENT, center - galley.size().y / 2.0),
+                    galley,
+                    Color32::GRAY,
+                );
+                if response.clicked() {
+                    ui.ctx().memory_mut(|memory| memory.request_focus(id));
+                    let on_arrow = response
+                        .interact_pointer_pos()
+                        .is_some_and(|pos| pos.x < left + INDENT);
+                    if !on_arrow {
+                        self.selected = Some(row.key);
+                        if let RowKey::Node(node) = row.key {
+                            chosen = Some(node);
+                        }
+                    }
+                    if expandable {
+                        toggled = Some(row.key);
+                    }
+                }
+            }
+        });
+        if let Some(index) = self.keep_visible.take() {
+            self.scroll_to = Some(index);
+            ui.ctx().request_repaint();
+        }
+        if let Some(key) = toggled {
+            self.toggle(key);
+        }
+        chosen
+    }
+}
+
+#[cfg(test)]
+mod tests {
     use super::*;
+    use crate::document::{self, Kind};
 
-    #[derive(Default)]
-    pub struct LazyNodes {
-        pub data: RefCell<Option<(Arc<Document>, Arc<[usize]>)>>,
-        pub cache: RefCell<HashMap<u32, glib::WeakRef<glib::BoxedAnyObject>>>,
+    fn tree(text: &str, kind: Kind) -> (Tree, Arc<Document>) {
+        let document = Arc::new(document::parse(Arc::from(text), kind, || false).unwrap());
+        let mut tree = Tree::default();
+        tree.set_document(document.clone());
+        (tree, document)
     }
 
-    #[glib::object_subclass]
-    impl ObjectSubclass for LazyNodes {
-        const NAME: &'static str = "XmlJsonLazyNodes";
-        type Type = super::LazyNodes;
-        type Interfaces = (gio::ListModel,);
-    }
-
-    impl ObjectImpl for LazyNodes {}
-
-    impl ListModelImpl for LazyNodes {
-        fn item_type(&self) -> glib::Type {
-            glib::BoxedAnyObject::static_type()
+    #[test]
+    fn large_branches_are_grouped_and_reveal_opens_only_the_target_block() {
+        let mut text = String::from("<r>");
+        for id in 0..1100 {
+            text.push_str(&format!("<e id=\"{id}\"/>"));
         }
-
-        fn n_items(&self) -> u32 {
-            self.data.borrow().as_ref().map_or(0, |(_, ids)| {
-                if ids.len() > 512 {
-                    ids.len().div_ceil(512) as u32
-                } else {
-                    ids.len() as u32
-                }
-            })
-        }
-
-        fn item(&self, position: u32) -> Option<glib::Object> {
-            let data = self.data.borrow();
-            let (document, ids) = data.as_ref()?;
-            if let Some(object) = self
-                .cache
-                .borrow()
-                .get(&position)
-                .and_then(|weak| weak.upgrade())
-            {
-                return Some(object.upcast());
-            }
-            let node = if ids.len() > 512 {
-                let start = position as usize * 512;
-                if start >= ids.len() {
-                    return None;
-                }
-                let end = (start + 512).min(ids.len());
-                NodeRef {
-                    document: document.clone(),
-                    id: usize::MAX,
-                    group: Some(Arc::from(&ids[start..end])),
-                    label: format!("Items {}–{}", start + 1, end),
-                }
-            } else {
-                let &id = ids.get(position as usize)?;
-                NodeRef {
-                    document: document.clone(),
-                    id,
-                    group: None,
-                    label: document.nodes[id].label.clone(),
-                }
-            };
-            let object = glib::BoxedAnyObject::new(node);
-            let mut cache = self.cache.borrow_mut();
-            if cache.len() > 2048 {
-                cache.retain(|_, weak| weak.upgrade().is_some());
-            }
-            cache.insert(position, object.downgrade());
-            Some(object.upcast())
-        }
+        text.push_str("</r>");
+        let (mut tree, document) = tree(&text, Kind::Xml);
+        assert_eq!(tree.rows.len(), 4, "root plus three lazy groups");
+        assert_eq!(tree.label(tree.rows[3].key), "Items 1025–1100");
+        let last = document.nodes.len() - 1;
+        let index = tree.reveal(last, false).unwrap();
+        assert_eq!(tree.rows[index].key, RowKey::Node(last));
+        assert!(
+            tree.rows.len() < 100,
+            "only the target group is materialized"
+        );
     }
-}
 
-glib::wrapper! {
-    pub struct LazyNodes(ObjectSubclass<imp::LazyNodes>) @implements gio::ListModel;
-}
-
-impl LazyNodes {
-    pub fn new(document: Arc<Document>, ids: Arc<[usize]>) -> Self {
-        let model: Self = glib::Object::new();
-        model.imp().data.replace(Some((document, ids)));
-        model
+    #[test]
+    fn reveal_expands_ancestors_and_optionally_the_target() {
+        let (mut tree, document) = tree(r#"{"a":[{"x":1},{"x":{"y":2}}]}"#, Kind::Json);
+        let target = document
+            .nodes
+            .iter()
+            .rposition(|n| n.label.starts_with("x:"))
+            .unwrap();
+        tree.reveal(target, false).unwrap();
+        assert!(!tree.is_expanded(RowKey::Node(target)));
+        tree.reveal(target, true).unwrap();
+        assert!(tree.is_expanded(RowKey::Node(target)));
+        let rows = tree.rows.len();
+        tree.toggle(RowKey::Node(target));
+        assert_eq!(tree.rows.len(), rows - 1);
     }
-}
-
-pub fn model(document: Arc<Document>) -> gtk::TreeListModel {
-    let roots = LazyNodes::new(document.clone(), document.roots.clone());
-    gtk::TreeListModel::new(roots, false, false, |object| {
-        let object = object.downcast_ref::<glib::BoxedAnyObject>()?;
-        let node = object.borrow::<NodeRef>();
-        let children = node
-            .group
-            .as_ref()
-            .unwrap_or_else(|| &node.document.nodes[node.id].children);
-        if children.is_empty() {
-            None
-        } else {
-            Some(LazyNodes::new(node.document.clone(), children.clone()).upcast())
-        }
-    })
-}
-
-pub fn node_at(model: &gtk::TreeListModel, index: u32) -> Option<NodeRef> {
-    let row = model.row(index)?;
-    let object = row.item()?.downcast::<glib::BoxedAnyObject>().ok()?;
-    Some(object.borrow::<NodeRef>().clone())
-}
-
-pub fn reveal(model: &gtk::TreeListModel, document: &Document, id: usize) -> Option<u32> {
-    let mut ancestors = Vec::new();
-    let mut parent = document.nodes[id].parent;
-    while let Some(id) = parent {
-        ancestors.push(id);
-        parent = document.nodes[id].parent;
-    }
-    for ancestor in ancestors.into_iter().rev().chain(std::iter::once(id)) {
-        let mut position = 0;
-        while position < model.n_items() {
-            let node = node_at(model, position)?;
-            if node
-                .group
-                .as_ref()
-                .is_some_and(|ids| ids.contains(&ancestor))
-            {
-                model.row(position)?.set_expanded(true);
-            }
-            if node.id == ancestor {
-                if ancestor == id {
-                    return Some(position);
-                }
-                model.row(position)?.set_expanded(true);
-                break;
-            }
-            position += 1;
-        }
-    }
-    None
 }

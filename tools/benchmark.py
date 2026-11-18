@@ -4,7 +4,6 @@ import argparse
 import importlib.util
 import json
 from pathlib import Path
-import resource
 import sys
 import time
 
@@ -21,6 +20,8 @@ def generate(directory, rows):
 
 
 def original(script, fixture):
+    import resource  # Unix only
+
     print("original: importing", file=sys.stderr, flush=True)
     from PyQt5.QtCore import QTimer
     from PyQt5.QtWidgets import QApplication

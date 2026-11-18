@@ -1,32 +1,31 @@
 # XML/JSON Viewer Rust
 
-A standalone XML and JSON editor written in Rust, using GTK4 and
-GtkSourceView 5. No browser runtime is embedded. Python is only needed for
-the installer and GUI test helpers, not to run the editor.
+A standalone XML and JSON editor written in Rust with
+[egui](https://github.com/emilk/egui). It runs on **Windows, Linux and
+macOS** from a single code base and needs no GTK, Qt or browser runtime:
+the executable is self-contained. Python is only needed for the Linux
+installer and the fixture generator, not to run the editor.
 
-## Linux build and installation
+## Download (Windows, Linux, macOS)
 
-The tested release platform is Linux x86-64. Build from source with Rust, a
-C toolchain, `pkg-config`, GTK **4.12 or newer**, GtkSourceView **5**, and
-`glib-compile-resources` (GLib development tools).
+Every tagged release (`v*`) is built by GitHub Actions and published on the
+repository's **Releases** page:
 
-On Debian or Ubuntu, install the development packages:
+- **Windows**: download `xmljson-viewer-rust-windows-x86_64.zip`, extract it
+  and run `xmljson-viewer-rust.exe`. Nothing else has to be installed.
+  Files can be opened from the menu, by drag-and-drop, or with
+  _Open with…_ in Explorer.
+- **Linux**: download `xmljson-viewer-rust-linux-x86_64.tar.gz`, extract it
+  and run `sh install.sh` from the extracted directory (see
+  [Linux installation](#linux-installation)).
+- **macOS** (Apple silicon): download
+  `xmljson-viewer-rust-macos-arm64.tar.gz` and run `bin/xmljson-viewer-rust`.
 
-```sh
-sudo apt update
-sudo apt install build-essential pkg-config libgtk-4-dev \
-  libgtksourceview-5-dev libglib2.0-bin
-```
+Builds for every push and pull request are available as workflow artifacts.
 
-Check that your distribution provides GTK 4.12 or newer with
-`pkg-config --modversion gtk4`. On Arch Linux, install the dependencies and
-build:
+## Building from source
 
-```sh
-sudo pacman -S --needed rust gtk4 gtksourceview5 pkgconf glib2
-```
-
-After installing the dependencies on either distribution, build and run:
+Install Rust with [rustup](https://rustup.rs/), then:
 
 ```sh
 cargo build --release --locked
@@ -34,119 +33,75 @@ cargo build --release --locked
 ./target/release/xmljson-viewer-rust example.xml example.json
 ```
 
-To install the built application in your user data directory and generate a
-desktop launcher, run `sh install.sh` from the project directory. See
-[Installation](#installation) for the destination and launcher details.
+- **Windows**: use the default MSVC toolchain that rustup installs (it
+  asks for the Visual Studio C++ Build Tools). No MSYS2 or GTK is needed.
+  If you use the GNU toolchain instead, `dlltool.exe` from a MinGW-w64
+  distribution must be on `PATH`.
+- **Linux**: a C toolchain plus fontconfig headers are needed to build
+  (`sudo apt install build-essential pkg-config libfontconfig1-dev` on
+  Debian/Ubuntu, `sudo pacman -S --needed base-devel fontconfig` on Arch).
+  At runtime the usual desktop libraries (X11 or Wayland, xkbcommon and a
+  Vulkan or OpenGL driver) are used.
+- **macOS**: Xcode command line tools.
 
-## Windows build
-
-Windows builds are **experimental and untested**; no prebuilt Windows
-package or installer is provided. The following uses the MSYS2 MinGW-w64
-GNU toolchain. Do not mix it with the MSVC Rust toolchain.
-
-1. Install [MSYS2](https://www.msys2.org/), then open the **MSYS2 MINGW64**
-   terminal from the Start menu.
-2. Update MSYS2, reopening the MINGW64 terminal and repeating the update if
-   prompted, then install the build tools and GTK dependencies:
-
-   ```sh
-   pacman -Syu
-   ```
-
-   ```sh
-   pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-pkgconf \
-     mingw-w64-x86_64-gtk4 mingw-w64-x86_64-gtksourceview5
-   ```
-
-3. Install Rust with rustup if it is not already installed. In the MINGW64
-   terminal, select the GNU toolchain:
-
-   ```sh
-   rustup toolchain install stable-gnu
-   rustup default stable-gnu
-   ```
-
-4. In that same terminal, change to the project directory and build and run:
-
-   ```sh
-   cd /c/path/to/xmljson-viewer
-   cargo build --release --locked
-   ./target/release/xmljson-viewer-rust.exe
-   ```
-
-   The MINGW64 terminal supplies the GTK runtime DLLs through its `PATH`.
-   Launch the application from that terminal; copying only the `.exe` to
-   another Windows machine is not a complete installation. The Linux
-   `install.sh`, `.desktop` launcher, and measurement helpers do not apply
-   to Windows.
+Release builds on Windows do not open a console window.
 
 ## Features
 
-- Independent tabs, undo/redo, line numbers, syntax colors, cursor position,
-  and resizable tree/editor panes.
+- Independent tabs, undo/redo, line numbers, syntax colors (JSON and XML),
+  cursor position, and a resizable tree panel.
 - Open multiple files through the menu, command-line arguments, or
-  drag-and-drop. Further launches open files in the existing instance using
-  `GApplication` and the session D-Bus.
+  drag-and-drop.
 - Click a tree item to select its source text. `Ctrl+E` selects the element
   at the cursor and reveals its tree path. `Ctrl+L` also expands that node
   and scrolls it into view. Clicking the node's text toggles expansion,
-  as does its arrow.
+  as does its arrow. The tree also supports arrow keys and Enter.
 - Source ranges handle repeated keys, repeated XML names, array indices,
-  numeric object keys, and Unicode.
+  numeric object keys, Unicode, CRLF line endings and a UTF-8 byte order
+  mark.
 - Tree labels distinguish keys, strings, numbers, literals, and XML
-  attributes with a dark high-contrast palette. Hover and selection stay
-  readable, and recycled rows have their old styling cleared.
+  attributes with a dark high-contrast palette.
 - Two-space formatting and explicit XML/JSON parsing.
 - Decode selected escaped content, including XML/JSON `auditData` wrappers,
   HTML entities, and escaped JSON strings.
-- Literal case-sensitive search, highlighted matches, an incremental
-  match count, and next/previous navigation with wraparound.
+- Literal case-sensitive search, highlighted matches, a match count, and
+  next/previous navigation with wraparound.
 - Save/Save as, dirty indicators, and confirmation before discarding edits.
-  GIO safely replaces file contents in the background. Edits made after a
-  save starts remain marked as unsaved.
+  Saving writes a temporary file next to the target and renames it over
+  the original in the background. Edits made after a save starts remain
+  marked as unsaved.
 
-| Shortcut | Action |
-|---|---|
-| Ctrl+T / Ctrl+W | New tab / close tab |
-| Ctrl+O | Open |
-| Ctrl+S / Ctrl+Shift+S | Save / Save as |
-| Ctrl+I | Format document |
-| Ctrl+E | Select element and reveal its tree path |
-| Ctrl+L | Locate, select, and expand the cursor's node |
-| Ctrl+F / Escape | Show / close search |
-| Enter in search, F3 / Shift+F3 | Next / previous match |
-| Ctrl+A / Ctrl+C / Ctrl+X | Select all / copy / cut, including hidden text |
-| Ctrl+Z / Ctrl+Shift+Z | Undo / redo |
-| Ctrl+Q | Quit |
+| Shortcut                          | Action                                       |
+| --------------------------------- | -------------------------------------------- |
+| Ctrl+T / Ctrl+W                   | New tab / close tab                          |
+| Ctrl+O                            | Open                                         |
+| Ctrl+S / Ctrl+Shift+S             | Save / Save as                               |
+| Ctrl+I                            | Format document                              |
+| Ctrl+E                            | Select element and reveal its tree path      |
+| Ctrl+L                            | Locate, select, and expand the cursor's node |
+| Ctrl+F / Escape                   | Show / close search                          |
+| Enter in search, F3 / Shift+F3    | Next / previous match                        |
+| Ctrl+A / Ctrl+C / Ctrl+X / Ctrl+V | Select all / copy / cut / paste              |
+| Ctrl+Z / Ctrl+Shift+Z (or Ctrl+Y) | Undo / redo                                  |
+| Ctrl+Q                            | Quit                                         |
+
+On macOS, Cmd replaces Ctrl.
 
 ## Large documents and limitations
 
-Documents must be UTF-8 and are held in memory in full. Keystrokes do not
-copy or parse the document. After **350 ms** without edits, a snapshot is
-analyzed by a single background worker. Obsolete results are cancelled or
-discarded using each tab's revision. This is a **full parse after a pause**,
-not an incremental parser. Inserting or replacing large buffers still has
-a GUI-thread cost; multi-GB files and completely pause-free loading are
-not promised.
+Documents must be UTF-8 and are held in memory in full, in a rope so that
+edits do not copy the document. Keystrokes do not parse the document.
+After **350 ms** without edits, a snapshot is analyzed by a single
+background worker. Obsolete results are cancelled or discarded using each
+tab's revision. This is a **full parse after a pause**, not an incremental
+parser.
 
-**Extreme JSON lines:** a valid JSON file containing a line longer than
-**16 KB** is automatically formatted when opened. The status bar explains
-the change, and the tab is marked modified. **Nothing is written to disk
-until Save.** Duplicate keys, value contents, ordering, and number tokens
-are preserved.
-
-JSON lines longer than **2,048 characters** are displayed in **512-character
-chunks**. A visible bar explains the hidden text and provides Previous/Next
-chunk buttons. Cursor movement and search reveal the appropriate chunk
-automatically. Hidden characters remain in the editor buffer: selecting,
-copying, cutting, and saving include the complete source. Strings are not
-truncated or changed by the chunked presentation.
-
-JSON uses a linear Rust lexer and materializes syntax tags only for the
-visible area, refreshing them on scroll. This avoids the native regex
-engine's two-second-per-line timeout and the cost of thousands of GUI tags
-on one extremely long line. Incomplete JSON edits retain lexical colors
-even when parsing fails. XML uses GtkSourceView's native highlighter.
+The editor only lays out and colors the lines that are visible. Lines
+longer than **4,096 characters** are additionally laid out in horizontal
+windows around the viewport, so extremely long single-line JSON can be
+opened, scrolled and edited without reformatting it or hiding any text.
+XML highlighting carries its lexer state across lines (comments, CDATA,
+multi-line tags) and recomputes it only from the edited line onwards.
 
 The tree creates rows on demand. Branches with more than **512 children**
 are grouped into expandable blocks. Selection shortcuts open the relevant
@@ -164,7 +119,10 @@ than introducing whitespace that changes their values. Decode handles
 common escaping layers without Python's `unicode_escape` transformation,
 which can corrupt Unicode.
 
-## Installation
+Each launch opens its own window; files are not forwarded to an already
+running instance.
+
+## Linux installation
 
 ```sh
 sh install.sh
@@ -196,80 +154,39 @@ the generated one for launching an installation.
 
 Copy the generated `xmljson-viewer-rust.desktop` to your desktop or
 `$XDG_DATA_HOME/applications` (default `$HOME/.local/share/applications`)
-to make it discoverable. Your file manager may ask you to allow launching
-the desktop shortcut.
+to make it discoverable.
 
 The application ID is **`io.github.xmljsonviewer.Viewer`**. The icon is
-embedded through `build.rs` and `resources/viewer.gresource.xml`, and is
-also installed as a PNG for desktop launchers. See
-`resources/icon-provenance.txt` for its provenance and licensing caveat.
-No third-party license for the supplied image has been independently
-verified; embedding it does not establish rights to redistribute it.
-A project license has not been selected yet. Choose a license and confirm
-the image's redistribution rights before publishing.
-
-To copy project sources elsewhere, run this from the project root:
-
-```sh
-mkdir -p /absolute/path/to/source-copy
-rsync -a --exclude=target/ --exclude=dist/ --exclude=.git/ \
-  --exclude=bench-data/ --exclude=reference/ --exclude=__pycache__/ \
-  --exclude='*.pyc' ./ /absolute/path/to/source-copy/
-```
-
-Source copies are independent from the installed binary. Build artifacts,
-temporary documents, and repository metadata should not be published.
+embedded in the executable and also installed as a PNG for desktop
+launchers. See `resources/icon-provenance.txt` for its provenance and
+licensing caveat. No third-party license for the supplied image has been
+independently verified; embedding it does not establish rights to
+redistribute it. A project license has not been selected yet. Choose a
+license and confirm the image's redistribution rights before publishing.
 
 ## Validation
 
 ```sh
 cargo test --locked
 cargo fmt --check
-cargo clippy --locked --all-targets
-desktop-file-validate xmljson-viewer-rust.desktop
-GTK_A11Y=none GDK_BACKEND=x11 GSK_RENDERER=cairo \
-  dbus-run-session -- xvfb-run -a \
-  ./target/release/xmljson-viewer-rust --ui-smoke
-GTK_A11Y=none QT_QPA_PLATFORM=xcb GDK_BACKEND=x11 GSK_RENDERER=cairo \
-  dbus-run-session -- xvfb-run -a python3 tools/test_desktop.py
+cargo clippy --locked --all-targets -- -D warnings
 ```
 
-GUI test helpers require Xvfb, `xdotool`, D-Bus utilities, Python 3, and
-PyQt5. Smoke tests cover tabs, Unicode source ranges, lazy groups, search,
-coalescing 100 edits, Decode, undo/redo, safe saving, and the embedded icon.
-The desktop test sends actual shortcuts and mouse clicks and checks the
-neutral D-Bus ID and multi-file single-instance behavior.
-
-For a read-only check with your own long-line JSON input:
-
-```sh
-GTK_A11Y=none QT_QPA_PLATFORM=xcb GDK_BACKEND=x11 GSK_RENDERER=cairo \
-  dbus-run-session -- xvfb-run -a \
-  python3 tools/test_real.py target/release/xmljson-viewer-rust /path/to/input.json
-```
-
-This helper checks visible colors using screenshots in memory, searching,
-copying hidden text, and the input file's unchanged hash. It does not
-save screenshots or distribute the input. Run it only in an isolated
-session/display, not against an existing user window.
+The tests need no display. Besides the parser, lexer and editor unit
+tests, they drive the application logic headlessly: tabs, Unicode source
+ranges, lazy groups, search, coalescing 100 edits into one parse, Decode,
+undo/redo, safe saving, close confirmation, and rendering complete frames
+of a large XML document with a long line.
 
 ## Reproducible measurements
 
 ```sh
 python3 tools/benchmark.py --generate bench-data --rows 20000
 ./target/release/xmljson-viewer-rust --benchmark bench-data/sample.json 5
-GTK_A11Y=none GDK_BACKEND=x11 GSK_RENDERER=cairo \
-  dbus-run-session -- xvfb-run -a \
-  ./target/release/xmljson-viewer-rust --gui-benchmark bench-data/sample.json
 ```
 
-The parse-only helper reports a mean over the requested iterations. The
-GUI helper waits for source, tree rows, and visible syntax colors, then
-adds **500 ms of stabilization** before checking. It is not a cold-start
-benchmark or a claim of complete repaint latency. Linux peak resident
-memory and the largest timer interval are also reported.
-
+The parse-only helper reports a mean over the requested iterations and,
+on Linux, the peak resident memory. On Windows, run it from a debug build
+(`cargo run -- --benchmark …`) because release builds have no console.
 Synthetic fixtures can be generated locally; no user documents are
-included. Results depend on hardware, rendering backend, document shape,
-and expansion state. Re-run these commands on representative documents
-rather than treating a single measurement as a universal speed guarantee.
+included. Results depend on hardware, document shape and expansion state.
