@@ -47,12 +47,9 @@ fn main() {
         .compile()
         .expect("Could not embed Windows icon resource");
     let target = env::var("TARGET").expect("Cargo provides TARGET");
-    let link_arg = if target.ends_with("windows-gnu") {
-        "-Wl,--whole-archive,-lresource,--no-whole-archive".to_string()
-    } else {
-        "/WHOLEARCHIVE:resource.lib".to_string()
-    };
-    println!("cargo:rustc-link-arg={link_arg}");
+    if target.ends_with("windows-gnu") {
+        println!("cargo:rustc-link-arg=-Wl,--whole-archive,-lresource,--no-whole-archive");
+    }
 }
 
 #[cfg(not(windows))]
