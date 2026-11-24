@@ -47,18 +47,10 @@ fn main() {
         .compile()
         .expect("Could not embed Windows icon resource");
     let target = env::var("TARGET").expect("Cargo provides TARGET");
-    let archive = if target.ends_with("windows-gnu") {
-        icon_path.with_file_name("libresource.a")
-    } else {
-        icon_path.with_file_name("resource.lib")
-    };
     let link_arg = if target.ends_with("windows-gnu") {
-        format!(
-            "-Wl,--whole-archive,{},--no-whole-archive",
-            archive.display()
-        )
+        "-Wl,--whole-archive,-lresource,--no-whole-archive".to_string()
     } else {
-        format!("/WHOLEARCHIVE:{}", archive.display())
+        "/WHOLEARCHIVE:resource.lib".to_string()
     };
     println!("cargo:rustc-link-arg={link_arg}");
 }
