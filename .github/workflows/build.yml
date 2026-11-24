@@ -16,9 +16,9 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            artifact: xmljson-viewer-rust-windows-x86_64
+            artifact: xmljson-viewer-windows-x86_64
           - os: ubuntu-latest
-            artifact: xmljson-viewer-rust-linux-x86_64
+            artifact: xmljson-viewer-linux-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -60,7 +60,7 @@ jobs:
         run: |
           $dir = "dist/${{ matrix.artifact }}"
           New-Item -ItemType Directory -Force $dir | Out-Null
-          Copy-Item target/release/xmljson-viewer-rust.exe, README.md, resources/icon-provenance.txt $dir
+          Copy-Item target/release/xmljson-viewer.exe, README.md, resources/icon-provenance.txt $dir
           Compress-Archive -Path $dir -DestinationPath "dist/${{ matrix.artifact }}.zip"
 
       - name: Package (Linux/macOS)
@@ -68,8 +68,8 @@ jobs:
         run: |
           dir="dist/${{ matrix.artifact }}"
           mkdir -p "$dir/bin" "$dir/resources"
-          cp target/release/xmljson-viewer-rust "$dir/bin/"
-          cp README.md install.sh xmljson-viewer-rust.desktop "$dir/"
+          cp target/release/xmljson-viewer "$dir/bin/"
+          cp README.md install.sh xmljson-viewer.desktop "$dir/"
           cp resources/visor-mascot.png resources/icon-provenance.txt "$dir/resources/"
           tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
 
@@ -108,17 +108,17 @@ jobs:
 
       - name: Package (macOS)
         run: |
-          dir="dist/xmljson-viewer-rust-macos-arm64"
+          dir="dist/xmljson-viewer-macos-arm64"
           mkdir -p "$dir/bin" "$dir/resources"
-          cp target/release/xmljson-viewer-rust "$dir/bin/"
-          cp README.md install.sh xmljson-viewer-rust.desktop "$dir/"
+          cp target/release/xmljson-viewer "$dir/bin/"
+          cp README.md install.sh xmljson-viewer.desktop "$dir/"
           cp resources/visor-mascot.png resources/icon-provenance.txt "$dir/resources/"
-          tar -C dist -czf "dist/xmljson-viewer-rust-macos-arm64.tar.gz" "xmljson-viewer-rust-macos-arm64"
+          tar -C dist -czf "dist/xmljson-viewer-macos-arm64.tar.gz" "xmljson-viewer-macos-arm64"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: xmljson-viewer-rust-macos-arm64
-          path: dist/xmljson-viewer-rust-macos-arm64.tar.gz
+          name: xmljson-viewer-macos-arm64
+          path: dist/xmljson-viewer-macos-arm64.tar.gz
 
   release:
     needs: build
@@ -129,7 +129,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: xmljson-viewer-rust-*-x86_64
+          pattern: xmljson-viewer-*-x86_64
           path: dist
           merge-multiple: true
 
@@ -147,7 +147,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: xmljson-viewer-rust-macos-arm64
+          name: xmljson-viewer-macos-arm64
           path: dist
 
       - name: Attach macOS package

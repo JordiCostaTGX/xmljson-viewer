@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Name=XML/JSON Viewer
+Comment=Independent XML and JSON editor
+Exec=xmljson-viewer %F
+Icon=xmljson-viewer
+Terminal=false
+Type=Application
+Categories=Utility;TextEditor;
+StartupNotify=true

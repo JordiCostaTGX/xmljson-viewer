@@ -231,6 +231,112 @@ fn smoke_ranges_tabs_groups_debounce_decode_undo_and_save() {
 }
 
 #[test]
+fn decode_selected_json_property_keeps_document_valid() {
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    load(
+        &mut app,
+        0,
+        r#"{"auditData":{"data":"{\"request\":{\"id\":1}}"}}"#,
+        Kind::Json,
+    );
+    let id = app.tabs[0]
+        .document
+        .as_ref()
+        .unwrap()
+        .nodes
+        .iter()
+        .position(|node| node.label.starts_with("data:"))
+        .unwrap();
+    app.tabs[0].select_node(id);
+    assert!(app.tabs[0].editor.selected_text().starts_with("\"data\":"));
+
+    app.perform(Action::Decode, &ctx, None);
+    wait(&mut app, |app| {
+        app.tabs[0].editor.text().contains("\n  \"auditData\": {")
+            && app.tabs[0].editor.text().contains("\"id\": 1")
+    });
+    let value: serde_json::Value = serde_json::from_str(&app.tabs[0].editor.text()).unwrap();
+    assert_eq!(value["auditData"]["data"]["request"]["id"], 1);
+}
+
+#[test]
+fn decode_without_selection_uses_the_whole_document() {
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    load(
+        &mut app,
+        0,
+        r#"{"auditData":{"data":"{\"request\":{\"id\":1}}"}}"#,
+        Kind::Json,
+    );
+    app.tabs[0].editor.select_range(0, 0);
+
+    app.perform(Action::Decode, &ctx, None);
+
+    assert_ne!(app.tabs[0].status, "Select text first (Ctrl+E)");
+    wait(&mut app, |app| {
+        app.tabs[0].editor.text().contains("\n  \"auditData\": {")
+            && app.tabs[0].editor.text().contains("\"id\": 1")
+    });
+    let value: serde_json::Value = serde_json::from_str(&app.tabs[0].editor.text()).unwrap();
+    assert_eq!(value["auditData"]["data"]["request"]["id"], 1);
+}
+
+#[test]
+fn decode_without_selection_structures_xml_document() {
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    load(
+        &mut app,
+        0,
+        "<auditData>&lt;r&gt;&lt;value&gt;1&lt;/value&gt;&lt;/r&gt;</auditData>",
+        Kind::Xml,
+    );
+    app.tabs[0].editor.select_range(0, 0);
+
+    app.perform(Action::Decode, &ctx, None);
+
+    wait(&mut app, |app| {
+        app.tabs[0].editor.text().contains("\n  <r>")
+    });
+    let text = app.tabs[0].editor.text();
+    document::parse(Arc::from(text.as_str()), Kind::Xml, || false).unwrap();
+    assert!(text.contains("<value>1</value>"));
+}
+
+#[test]
+fn files_forwarded_from_another_instance_open_as_tabs() {
+    let directory = unique_path("xmljson-single-instance");
+    fs::create_dir(&directory).unwrap();
+    let json_path = directory.join("first.json");
+    let xml_path = directory.join("second.xml");
+    fs::write(&json_path, r#"{"first":1}"#).unwrap();
+    fs::write(&xml_path, "<second/>").unwrap();
+
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    let (send, requests) = mpsc::channel();
+    app.open_requests = Some(requests);
+    send.send(vec![json_path.clone(), xml_path.clone()])
+        .unwrap();
+    app.receive_open_requests(&ctx);
+
+    assert_eq!(app.tabs.len(), 2);
+    wait(&mut app, |app| {
+        app.tabs
+            .iter()
+            .all(|tab| tab.path.is_some() && tab.editor.editable)
+    });
+    assert_eq!(app.tabs[0].path.as_ref(), Some(&json_path));
+    assert_eq!(app.tabs[1].path.as_ref(), Some(&xml_path));
+
+    fs::remove_file(json_path).unwrap();
+    fs::remove_file(xml_path).unwrap();
+    fs::remove_dir(directory).unwrap();
+}
+
+#[test]
 fn dirty_tabs_ask_before_closing_and_clean_tabs_close_directly() {
     let mut app = App::new(None);
     app.new_tab();
@@ -272,6 +378,6 @@ fn renders_frames_headless() {
     let end = app.tabs[0].editor.len_chars();
     app.tabs[0].editor.select_range(end - 10, end);
     frame(&mut app);
-    assert_eq!(app.title, "XML/JSON Viewer Rust — Untitled");
+    assert_eq!(app.title, "XML/JSON Viewer — Untitled");
     assert!(app.tabs[0].editor.match_count() > 1100);
 }
