@@ -46,6 +46,32 @@ cargo build --release --locked
 
 Release builds on Windows do not open a console window.
 
+## Startup diagnostics
+
+Each GUI launch overwrites the single `startup.log` file in
+`%LOCALAPPDATA%\xmljson-viewer\logs` on Windows. If that directory is
+unavailable, the application uses `xmljson-viewer/logs` inside the system
+temporary directory (also the default on Linux and macOS).
+
+The log records the application version, OS, architecture, process ID and
+startup stages, including single-instance communication and graphics/window
+initialization. Startup errors and Rust panics automatically open the log
+in Notepad on Windows (the default file viewer on Linux and macOS) and
+display an error dialog with the error and log path. If opening the log
+fails, the dialog reports that too. Panic logs also include a backtrace.
+When reporting a launch failure, attach `startup.log` and the dialog text
+before launching the application again, since the next launch clears the
+log. Older `startup-*.log` files from previous versions can be deleted
+manually. File contents and
+command-line paths are not logged routinely, but error or panic messages
+can contain paths or other diagnostic details; review logs before sharing.
+
+If Windows blocks execution before the application starts, or a required
+DLL cannot be loaded, no application log or dialog may be produced. Check
+Windows Security protection history and Reliability Monitor (`perfmon /rel`)
+in that case. These diagnostics do not sign the executable or remove
+SmartScreen warnings. Benchmark mode does not create startup logs or dialogs.
+
 ## Features
 
 - Independent tabs, undo/redo, line numbers, syntax colors (JSON and XML),
