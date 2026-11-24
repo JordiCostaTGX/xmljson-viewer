@@ -1112,6 +1112,7 @@ pub fn run(files: Vec<PathBuf>, requests: mpsc::Receiver<Vec<PathBuf>>) -> efram
         APP_TITLE,
         options,
         Box::new(move |creation| {
+            crate::diagnostics::record("Window and graphics context created; initializing editor");
             creation.egui_ctx.set_theme(ThemePreference::Dark);
             #[cfg(target_os = "windows")]
             set_native_dark_titlebar(creation);
@@ -1120,6 +1121,7 @@ pub fn run(files: Vec<PathBuf>, requests: mpsc::Receiver<Vec<PathBuf>>) -> efram
             for path in files {
                 app.open(path);
             }
+            crate::diagnostics::record("Editor initialized");
             Ok(Box::new(app))
         }),
     )

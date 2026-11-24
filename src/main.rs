@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod diagnostics;
 mod document;
 mod editor;
 mod single_instance;
@@ -12,28 +13,42 @@ use document::Kind;
 use std::{path::PathBuf, sync::Arc, time::Instant};
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).is_some_and(|arg| arg == "--benchmark") {
-        if let Err(error) = benchmark(&args[2..]) {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--benchmark") {
+        let benchmark_args: Vec<_> = args[1..]
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        if let Err(error) = benchmark(&benchmark_args) {
             eprintln!("{error}");
             std::process::exit(1);
         }
         return;
     }
-    let files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    diagnostics::initialize();
+    let files: Vec<PathBuf> = args.into_iter().map(PathBuf::from).collect();
+    diagnostics::record(&format!("Open requests: {} file(s)", files.len()));
     let (incoming, requests) = std::sync::mpsc::channel();
+    diagnostics::record("Initializing single-instance listener or forwarding request");
     match single_instance::forward_or_start(files.clone(), incoming) {
-        Ok(true) => return,
-        Ok(false) => {}
+        Ok(true) => {
+            diagnostics::record("Request forwarded to existing instance; exiting");
+            return;
+        }
+        Ok(false) => diagnostics::record("Single-instance listener ready"),
         Err(error) => {
-            eprintln!("{error}");
+            diagnostics::report_error(&format!("Single-instance initialization failed: {error}"));
             std::process::exit(1);
         }
     }
+    diagnostics::record("Initializing window and graphics renderer");
     if let Err(error) = ui::run(files, requests) {
-        eprintln!("{error}");
+        diagnostics::report_error(&format!(
+            "Window or graphics initialization failed: {error}"
+        ));
         std::process::exit(1);
     }
+    diagnostics::record("Application exited normally");
 }
 
 fn benchmark(args: &[String]) -> Result<(), String> {
