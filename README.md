@@ -1,4 +1,4 @@
-# XML/JSON Viewer Rust
+# XML/JSON Viewer
 
 A standalone XML and JSON editor written in Rust with
 [egui](https://github.com/emilk/egui). It runs on **Windows, Linux and
@@ -11,15 +11,15 @@ installer and the fixture generator, not to run the editor.
 Every tagged release (`v*`) is built by GitHub Actions and published on the
 repository's **Releases** page:
 
-- **Windows**: download `xmljson-viewer-rust-windows-x86_64.zip`, extract it
-  and run `xmljson-viewer-rust.exe`. Nothing else has to be installed.
+- **Windows**: download `xmljson-viewer-windows-x86_64.zip`, extract it
+  and run `xmljson-viewer.exe`. Nothing else has to be installed.
   Files can be opened from the menu, by drag-and-drop, or with
   _Open with…_ in Explorer.
-- **Linux**: download `xmljson-viewer-rust-linux-x86_64.tar.gz`, extract it
+- **Linux**: download `xmljson-viewer-linux-x86_64.tar.gz`, extract it
   and run `sh install.sh` from the extracted directory (see
   [Linux installation](#linux-installation)).
 - **macOS** (Apple silicon): download
-  `xmljson-viewer-rust-macos-arm64.tar.gz` and run `bin/xmljson-viewer-rust`.
+  `xmljson-viewer-macos-arm64.tar.gz` and run `bin/xmljson-viewer`.
 
 Builds for every push and pull request are available as workflow artifacts.
 
@@ -29,8 +29,8 @@ Install Rust with [rustup](https://rustup.rs/), then:
 
 ```sh
 cargo build --release --locked
-./target/release/xmljson-viewer-rust
-./target/release/xmljson-viewer-rust example.xml example.json
+./target/release/xmljson-viewer
+./target/release/xmljson-viewer example.xml example.json
 ```
 
 - **Windows**: use the default MSVC toolchain that rustup installs (it
@@ -132,8 +132,8 @@ For a prebuilt Linux archive, extract it and run the same command from the
 extracted directory. The installer accepts either a source build in
 `target/release` or a prebuilt executable in `bin`.
 
-The default destination is `$XDG_DATA_HOME/xmljson-viewer-rust`, or
-`$HOME/.local/share/xmljson-viewer-rust` when `XDG_DATA_HOME` is unset.
+The default destination is `$XDG_DATA_HOME/xmljson-viewer`, or
+`$HOME/.local/share/xmljson-viewer` when `XDG_DATA_HOME` is unset.
 An absolute destination may be supplied explicitly:
 
 ```sh
@@ -145,19 +145,19 @@ double quotes, dollar signs, backticks, and control characters are rejected
 explicitly because they do not work reliably in desktop launcher executable
 paths. Use a different absolute destination if needed.
 
-The installer copies the release to `bin/xmljson-viewer-rust`, installs the
+The installer copies the release to `bin/xmljson-viewer`, installs the
 README and icon, and generates a `.desktop` file with absolute `Exec` and
 `Icon` paths for that destination. It refuses to overwrite an already
 installed binary. It does not register MIME defaults or change existing
 applications. The source `.desktop` is a path-independent template; use
 the generated one for launching an installation.
 
-Copy the generated `xmljson-viewer-rust.desktop` to your desktop or
+Copy the generated `xmljson-viewer.desktop` to your desktop or
 `$XDG_DATA_HOME/applications` (default `$HOME/.local/share/applications`)
 to make it discoverable.
 
 The application ID is **`io.github.xmljsonviewer.Viewer`**. The icon is
-embedded in the executable and also installed as a PNG for desktop
+embedded in the Windows executable and also installed as a PNG for desktop
 launchers. See `resources/icon-provenance.txt` for its provenance and
 licensing caveat. No third-party license for the supplied image has been
 independently verified; embedding it does not establish rights to
@@ -182,7 +182,7 @@ of a large XML document with a long line.
 
 ```sh
 python3 tools/benchmark.py --generate bench-data --rows 20000
-./target/release/xmljson-viewer-rust --benchmark bench-data/sample.json 5
+./target/release/xmljson-viewer --benchmark bench-data/sample.json 5
 ```
 
 The parse-only helper reports a mean over the requested iterations and,

@@ -24,16 +24,63 @@ use std::{
 #[path = "ui_tests.rs"]
 mod tests;
 
-const APP_TITLE: &str = "XML/JSON Viewer Rust";
+const APP_TITLE: &str = "XML/JSON Viewer";
 pub const APP_ID: &str = "io.github.xmljsonviewer.Viewer";
 const DEBOUNCE: Duration = Duration::from_millis(350);
 const SEARCH_ID: &str = "search-input";
+
+#[cfg(target_os = "windows")]
+fn set_native_dark_titlebar(creation: &eframe::CreationContext<'_>) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Graphics::Dwm::{
+        DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
+    };
+
+    let Ok(handle) = creation.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = handle.hwnd.get() as _;
+    let enabled = 1i32;
+    let caption_color = 0u32;
+    let text_color = 0x00ff_ffffu32;
+    unsafe {
+        let result = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+            (&enabled as *const i32).cast(),
+            std::mem::size_of::<i32>() as u32,
+        );
+        if result < 0 {
+            DwmSetWindowAttribute(
+                hwnd,
+                19,
+                (&enabled as *const i32).cast(),
+                std::mem::size_of::<i32>() as u32,
+            );
+        }
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR as u32,
+            (&caption_color as *const u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        );
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TEXT_COLOR as u32,
+            (&text_color as *const u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
+}
 
 enum Task {
     Parse(Arc<str>, Kind),
     Open(PathBuf),
     Format(Arc<str>, Kind),
-    Decode(String, usize, usize),
+    Decode(String, String, usize, usize),
     Save(PathBuf, String),
 }
 
@@ -61,6 +108,23 @@ struct Reply {
     tab: u64,
     revision: u64,
     output: Output,
+}
+
+fn replace_char_range(source: &str, start: usize, end: usize, replacement: &str) -> String {
+    let start_byte = source
+        .char_indices()
+        .nth(start)
+        .map_or(source.len(), |(byte, _)| byte);
+    let end_byte = source
+        .char_indices()
+        .nth(end)
+        .map_or(source.len(), |(byte, _)| byte);
+    format!(
+        "{}{}{}",
+        &source[..start_byte],
+        replacement,
+        &source[end_byte..]
+    )
 }
 
 fn worker(notify: impl Fn() + Send + 'static) -> (mpsc::Sender<Job>, mpsc::Receiver<Reply>) {
@@ -98,8 +162,17 @@ fn worker(notify: impl Fn() + Send + 'static) -> (mpsc::Sender<Job>, mpsc::Recei
                     ),
                 },
                 Task::Format(text, kind) => Output::Formatted(document::format(&text, kind)),
-                Task::Decode(text, start, end) => {
-                    Output::Decoded(document::decode(&text), start, end)
+                Task::Decode(selected, source, start, end) => {
+                    let source_len = source.chars().count();
+                    let decoded = document::decode(&selected).and_then(|decoded| {
+                        decoded
+                            .map(|text| {
+                                let source = replace_char_range(&source, start, end, &text);
+                                document::format(&source, Kind::detect(&source))
+                            })
+                            .transpose()
+                    });
+                    Output::Decoded(decoded, 0, source_len)
                 }
                 Task::Save(path, text) => {
                     let result =
@@ -289,6 +362,7 @@ pub struct App {
     next_id: u64,
     jobs: mpsc::Sender<Job>,
     replies: mpsc::Receiver<Reply>,
+    open_requests: Option<mpsc::Receiver<Vec<PathBuf>>>,
     search_visible: bool,
     search_query: String,
     focus_search: bool,
@@ -321,6 +395,7 @@ impl App {
             next_id: 0,
             jobs,
             replies,
+            open_requests: None,
             search_visible: false,
             search_query: String::new(),
             focus_search: false,
@@ -383,6 +458,24 @@ impl App {
         self.submit(index, Task::Open(path));
     }
 
+    fn receive_open_requests(&mut self, ctx: &egui::Context) {
+        let requests: Vec<_> = self
+            .open_requests
+            .as_ref()
+            .map(|receiver| receiver.try_iter().collect())
+            .unwrap_or_default();
+        for files in requests {
+            if files.is_empty() {
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            } else {
+                for path in files {
+                    self.open(path);
+                }
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            }
+        }
+    }
+
     fn poll(&mut self) {
         // Limit work per frame so many completions cannot monopolize the UI.
         for _ in 0..8 {
@@ -433,7 +526,7 @@ impl App {
             Output::Decoded(Ok(Some(text)), start, end) => {
                 tab.editor.replace(start..end, &text);
                 tab.note_changes(Instant::now());
-                tab.status = "Selection decoded".into();
+                tab.status = "Selection decoded and document structured".into();
             }
             Output::Decoded(Ok(None), ..) => tab.status = "No escaped content to decode".into(),
             Output::Decoded(Err(error), ..) => tab.status = format!("Decode error: {error}"),
@@ -627,11 +720,17 @@ impl App {
             Action::Decode => {
                 let tab = &mut self.tabs[index];
                 let selection = tab.editor.selection();
-                if selection.is_empty() {
-                    tab.status = "Select text first (Ctrl+E)".into();
+                let source = tab.editor.text();
+                let (text, start, end) = if selection.is_empty() {
+                    let end = tab.editor.len_chars();
+                    (source.clone(), 0, end)
                 } else {
-                    let text = tab.editor.selected_text();
-                    self.submit(index, Task::Decode(text, selection.start, selection.end));
+                    (tab.editor.selected_text(), selection.start, selection.end)
+                };
+                if text.is_empty() {
+                    tab.status = "No text to decode".into();
+                } else {
+                    self.submit(index, Task::Decode(text, source, start, end));
                 }
             }
             Action::Undo => {
@@ -766,6 +865,7 @@ impl App {
     fn show(&mut self, ui: &mut egui::Ui, frame: Option<&eframe::Frame>) {
         let ctx = ui.ctx().clone();
         self.poll();
+        self.receive_open_requests(&ctx);
         let dropped: Vec<PathBuf> = ctx.input(|input| {
             input
                 .raw
@@ -946,7 +1046,7 @@ impl eframe::App for App {
     }
 }
 
-pub fn run(files: Vec<PathBuf>) -> eframe::Result {
+pub fn run(files: Vec<PathBuf>, requests: mpsc::Receiver<Vec<PathBuf>>) -> eframe::Result {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../resources/visor-mascot.png"))
         .expect("Embedded viewer icon must be a valid PNG");
     let options = eframe::NativeOptions {
@@ -962,9 +1062,12 @@ pub fn run(files: Vec<PathBuf>) -> eframe::Result {
     eframe::run_native(
         APP_TITLE,
         options,
-        Box::new(|creation| {
+        Box::new(move |creation| {
             creation.egui_ctx.set_theme(ThemePreference::Dark);
+            #[cfg(target_os = "windows")]
+            set_native_dark_titlebar(creation);
             let mut app = App::new(Some(creation.egui_ctx.clone()));
+            app.open_requests = Some(requests);
             for path in files {
                 app.open(path);
             }

@@ -1,4 +1,7 @@
-use quick_xml::{Reader, Writer, events::Event};
+use quick_xml::{
+    Reader, Writer,
+    events::{BytesText, Event},
+};
 use serde::Deserialize;
 use std::{ops::Range, sync::Arc};
 
@@ -493,12 +496,138 @@ pub fn format(text: &str, kind: Kind) -> Result<String, String> {
     }
 }
 
+fn embedded_xml(text: &str) -> Option<(&str, &str, &str)> {
+    let start = if text.trim_start().starts_with("postData:[") {
+        text.find("<?xml").or_else(|| text.find('<'))?
+    } else {
+        let trimmed_start = text.len() - text.trim_start().len();
+        let trimmed = &text[trimmed_start..];
+        (trimmed.starts_with("<?xml") || trimmed.starts_with('<')).then_some(trimmed_start)?
+    };
+    let end = text.rfind('>')?.checked_add(1)?;
+    (start < end).then_some((&text[..start], &text[start..end], &text[end..]))
+}
+
+fn write_decoded_xml(
+    writer: &mut Writer<Vec<u8>>,
+    raw: &str,
+    depth: usize,
+) -> Result<bool, String> {
+    if depth > 8 {
+        return Err("XML nesting exceeds the decode limit".into());
+    }
+    let mut reader = Reader::from_str(raw);
+    let mut changed = false;
+    loop {
+        let event = reader.read_event().map_err(|e| format!("XML: {e}"))?;
+        match event {
+            Event::Eof => break,
+            Event::Text(text) => {
+                let decoded = text.unescape().map_err(|e| e.to_string())?;
+                if let Some((prefix, payload, suffix)) = embedded_xml(&decoded)
+                    && let Ok(formatted) = format(payload, Kind::Xml)
+                {
+                    if !prefix.is_empty() {
+                        writer
+                            .write_event(Event::Text(BytesText::new(prefix)))
+                            .map_err(|e| e.to_string())?;
+                    }
+                    write_decoded_xml(writer, &formatted, depth + 1)?;
+                    if !suffix.is_empty() {
+                        writer
+                            .write_event(Event::Text(BytesText::new(suffix)))
+                            .map_err(|e| e.to_string())?;
+                    }
+                    changed = true;
+                    continue;
+                }
+                writer
+                    .write_event(Event::Text(text))
+                    .map_err(|e| e.to_string())?;
+            }
+            Event::Decl(_) if depth > 0 => {}
+            other => writer.write_event(other).map_err(|e| e.to_string())?,
+        }
+    }
+    Ok(changed)
+}
+
+fn decode_embedded_xml(raw: &str) -> Result<Option<String>, String> {
+    let mut writer = Writer::new_with_indent(Vec::new(), b' ', 2);
+    if !write_decoded_xml(&mut writer, raw, 0)? {
+        return Ok(None);
+    }
+    String::from_utf8(writer.into_inner())
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+fn decode_json_properties(raw: &str) -> Result<Option<String>, String> {
+    let json_wrapper = regex::Regex::new(
+        r#"(?is)(?P<prefix>"(?:\\.|[^"\\])*"\s*:\s*)(?P<value>"(?:\\.|[^"\\])*")"#,
+    )
+    .map_err(|e| e.to_string())?;
+    let mut output = String::with_capacity(raw.len());
+    let mut copied_until = 0;
+    let mut changed = false;
+    for parts in json_wrapper.captures_iter(raw) {
+        let prefix = parts.name("prefix").ok_or("JSON property has no key")?;
+        let inner = parts.name("value").ok_or("JSON property has no value")?;
+        let Some((decoded, kind)) = decode_content(inner.as_str())? else {
+            continue;
+        };
+        let value = if kind == Some(Kind::Json) {
+            decoded
+        } else {
+            serde_json::to_string(&decoded).map_err(|e| e.to_string())?
+        };
+        if value == inner.as_str() {
+            continue;
+        }
+        output.push_str(&raw[copied_until..prefix.start()]);
+        output.push_str(prefix.as_str());
+        output.push_str(&value);
+        copied_until = inner.end();
+        changed = true;
+    }
+    if changed {
+        output.push_str(&raw[copied_until..]);
+        Ok(Some(output))
+    } else {
+        Ok(None)
+    }
+}
+
+fn decode_json_recursively(raw: &str) -> Result<Option<String>, String> {
+    let mut current = raw.to_string();
+    let mut changed = false;
+    for _ in 0..128 {
+        let Some(next) = decode_json_properties(&current)? else {
+            break;
+        };
+        current = next;
+        changed = true;
+    }
+    if changed && decode_json_properties(&current)?.is_some() {
+        return Err("JSON decode nesting exceeds the safety limit".into());
+    }
+    Ok(changed.then_some(current))
+}
+
 pub fn decode(raw: &str) -> Result<Option<String>, String> {
     let xml_wrapper =
         regex::Regex::new(r"(?is)(<\s*auditData\b[^>]*>)(.*?)(<\s*/\s*auditData\s*>)")
             .map_err(|e| e.to_string())?;
     if let Some(parts) = xml_wrapper.captures(raw) {
         let inner = parts.get(2).ok_or("auditData has no content")?;
+        if let Some(value) = decode_embedded_xml(inner.as_str())? {
+            return Ok(Some(format!(
+                "{}{}{}",
+                &raw[..inner.start()],
+                value,
+                &raw[inner.end()..]
+            )));
+        }
         if let Some((value, _)) = decode_content(inner.as_str())? {
             return Ok(Some(format!(
                 "{}{}{}",
@@ -508,23 +637,8 @@ pub fn decode(raw: &str) -> Result<Option<String>, String> {
             )));
         }
     }
-    let json_wrapper = regex::Regex::new(r#"(?is)("auditData"\s*:\s*)("(?:\\.|[^"\\])*")"#)
-        .map_err(|e| e.to_string())?;
-    if let Some(parts) = json_wrapper.captures(raw) {
-        let inner = parts.get(2).ok_or("auditData has no content")?;
-        if let Some((value, kind)) = decode_content(inner.as_str())? {
-            let value = if kind == Some(Kind::Json) {
-                value
-            } else {
-                serde_json::to_string(&value).map_err(|e| e.to_string())?
-            };
-            return Ok(Some(format!(
-                "{}{}{}",
-                &raw[..inner.start()],
-                value,
-                &raw[inner.end()..]
-            )));
-        }
+    if let Some(value) = decode_json_recursively(raw)? {
+        return Ok(Some(value));
     }
     if let Some((value, _)) = decode_content(raw.trim())? {
         let leading = &raw[..raw.len() - raw.trim_start().len()];
@@ -660,6 +774,35 @@ mod tests {
         let xml = "<auditData>&lt;r&gt;é&lt;/r&gt;</auditData>";
         assert!(decode(xml).unwrap().unwrap().contains("<r>é</r>"));
         assert!(decode("plain text").unwrap().is_none());
+    }
+
+    #[test]
+    fn decoding_escaped_json_in_any_selected_property() {
+        let selection = r#""data":"{\"result\":{\"ok\":true}}""#;
+        let decoded = decode(selection).unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&format!("{{{decoded}}}")).unwrap();
+        assert_eq!(value["data"]["result"]["ok"], true);
+    }
+
+    #[test]
+    fn decoding_whole_json_skips_plain_strings_and_decodes_nested_payloads() {
+        let json = r#"{"note":"keep me","auditData":{"request":"{\"id\":1}","response":"{\"data\":\"{\\\"ok\\\":true}\"}"}}"#;
+        let decoded = decode(json).unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&decoded).unwrap();
+        assert_eq!(value["note"], "keep me");
+        assert_eq!(value["auditData"]["request"]["id"], 1);
+        assert_eq!(value["auditData"]["response"]["data"]["ok"], true);
+    }
+
+    #[test]
+    fn decoding_legacy_audit_data_unescapes_embedded_xml_payloads() {
+        let xml = "<audit><ValuationRS><auditData><transactions><RQ>postData:[&lt;?xml version=\"1.0\"?&gt;&lt;customer&gt;&lt;id&gt;123&lt;/id&gt;&lt;/customer&gt;]</RQ><RS>&lt;?xml version=\"1.0\"?&gt;&lt;result&gt;&lt;successful&gt;TRUE&lt;/successful&gt;&lt;/result&gt;</RS></transactions></auditData></ValuationRS></audit>";
+        let decoded = decode(xml).unwrap().unwrap();
+        assert!(decoded.contains("<customer>"));
+        assert!(decoded.contains("<id>123</id>"));
+        assert!(decoded.contains("<result>"));
+        assert!(decoded.contains("<successful>TRUE</successful>"));
+        parsed(&decoded, Kind::Xml);
     }
 
     #[test]

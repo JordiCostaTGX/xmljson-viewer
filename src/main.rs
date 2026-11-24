@@ -2,6 +2,7 @@
 
 mod document;
 mod editor;
+mod single_instance;
 mod syntax;
 mod tree;
 mod tree_style;
@@ -19,8 +20,17 @@ fn main() {
         }
         return;
     }
-    let files = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    if let Err(error) = ui::run(files) {
+    let files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    let (incoming, requests) = std::sync::mpsc::channel();
+    match single_instance::forward_or_start(files.clone(), incoming) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    }
+    if let Err(error) = ui::run(files, requests) {
         eprintln!("{error}");
         std::process::exit(1);
     }
