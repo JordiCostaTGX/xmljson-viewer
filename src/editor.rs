@@ -149,7 +149,11 @@ impl Editor {
     }
 
     pub fn selected_text(&self) -> String {
-        self.rope.slice(self.selection()).to_string()
+        self.slice(self.selection())
+    }
+
+    pub fn slice(&self, range: Range<usize>) -> String {
+        self.rope.slice(range).to_string()
     }
 
     /// Zero-based line and column of the cursor.

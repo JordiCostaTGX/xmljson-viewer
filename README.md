@@ -64,6 +64,9 @@ Release builds on Windows do not open a console window.
 - Two-space formatting and explicit XML/JSON parsing.
 - Decode selected escaped content, including XML/JSON `auditData` wrappers,
   HTML entities, and escaped JSON strings.
+- Right-click a JSON string and choose **Open as XML**, or right-click an XML
+  text or CDATA node and choose **Open as JSON** for embedded objects and arrays.
+  The decoded payload opens in a new tab without changing the source document.
 - Literal case-sensitive search, highlighted matches, a match count, and
   next/previous navigation with wraparound.
 - Save/Save as, dirty indicators, and confirmation before discarding edits.

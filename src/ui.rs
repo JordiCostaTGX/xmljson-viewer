@@ -240,6 +240,7 @@ struct Tab {
     debounce: Option<Instant>,
     kind: Option<Kind>,
     path: Option<PathBuf>,
+    untitled_name: &'static str,
     dirty: bool,
     saving: bool,
     close_after_save: bool,
@@ -261,6 +262,7 @@ impl Tab {
             debounce: None,
             kind: None,
             path: None,
+            untitled_name: "Untitled",
             dirty: false,
             saving: false,
             close_after_save: false,
@@ -278,7 +280,7 @@ impl Tab {
             .as_ref()
             .and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Untitled".into())
+            .unwrap_or_else(|| self.untitled_name.into())
     }
 
     fn set_kind(&mut self, kind: Kind) {
@@ -329,6 +331,7 @@ impl Tab {
 enum Action {
     New,
     Open,
+    OpenEmbedded { tab: u64, node: usize },
     Save,
     SaveAs,
     CloseActive,
@@ -456,6 +459,47 @@ impl App {
         tab.editor.editable = false;
         tab.status = format!("Opening {}…", path.display());
         self.submit(index, Task::Open(path));
+    }
+
+    fn open_embedded(&mut self, tab_id: u64, node_id: usize) {
+        let Some(index) = self.index(tab_id) else {
+            return;
+        };
+        let source = &mut self.tabs[index];
+        source.note_changes(Instant::now());
+        if !source.tree_current() {
+            return;
+        }
+        let Some(node) = source
+            .document
+            .as_ref()
+            .and_then(|doc| doc.nodes.get(node_id))
+        else {
+            return;
+        };
+        let Some(kind) = node.embedded_kind() else {
+            return;
+        };
+        let raw = source
+            .editor
+            .slice(node.chars.start as usize..node.chars.end as usize);
+        let Some(payload) = node.embedded_payload(&raw) else {
+            source.status = match kind {
+                Kind::Xml => "This node does not contain XML",
+                Kind::Json => "This node does not contain a JSON object or array",
+            }
+            .into();
+            return;
+        };
+        let index = self.new_tab();
+        let tab = &mut self.tabs[index];
+        tab.untitled_name = match kind {
+            Kind::Xml => "Embedded XML",
+            Kind::Json => "Embedded JSON",
+        };
+        tab.editor.set_text(&payload);
+        tab.seen_version = tab.editor.version();
+        self.parse(index, Some(kind));
     }
 
     fn receive_open_requests(&mut self, ctx: &egui::Context) {
@@ -688,6 +732,7 @@ impl App {
                     self.open(path);
                 }
             }
+            Action::OpenEmbedded { tab, node } => self.open_embedded(tab, node),
             Action::Save => self.save(false, frame),
             Action::SaveAs => self.save(true, frame),
             Action::CloseActive => self.close_tab(self.tabs[index].id),
@@ -1004,8 +1049,12 @@ impl App {
                 let chosen = ui
                     .add_enabled_ui(current, |ui| tab.tree.ui(ui, Id::unique(("tree", tab.id))))
                     .inner;
-                if let Some(id) = chosen {
-                    tab.select_node(id);
+                match chosen {
+                    Some(crate::tree::TreeAction::Select(id)) => tab.select_node(id),
+                    Some(crate::tree::TreeAction::OpenEmbedded(node)) => {
+                        actions.push(Action::OpenEmbedded { tab: tab.id, node });
+                    }
+                    None => {}
                 }
             });
         let focus = self.dialog.is_none() && std::mem::take(&mut self.focus_editor);

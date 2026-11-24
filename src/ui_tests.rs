@@ -40,6 +40,66 @@ fn load(app: &mut App, index: usize, text: &str, kind: Kind) {
 }
 
 #[test]
+fn opens_embedded_documents_without_changing_the_source() {
+    for (source, outer, inner, expected) in [
+        (
+            r#"{"da:ta": "\u003croot\u003e\n<item/>\u003c/root\u003e"}"#,
+            Kind::Json,
+            Kind::Xml,
+            "<root>\n<item/></root>",
+        ),
+        (
+            r#"<data>{&quot;value&quot;:&quot;a &amp; b&quot;}</data>"#,
+            Kind::Xml,
+            Kind::Json,
+            r#"{"value":"a & b"}"#,
+        ),
+        (
+            r#"<data><![CDATA[["&amp;"]]]></data>"#,
+            Kind::Xml,
+            Kind::Json,
+            r#"["&amp;"]"#,
+        ),
+    ] {
+        let mut app = App::new(None);
+        load(&mut app, 0, source, outer);
+        let original = &app.tabs[0];
+        app.perform(
+            Action::OpenEmbedded {
+                tab: original.id,
+                node: 1,
+            },
+            &egui::Context::default(),
+            None,
+        );
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active, 1);
+        wait(&mut app, current);
+        assert_eq!(app.tabs[1].kind, Some(inner));
+        assert_eq!(app.tabs[1].editor.text(), expected);
+        assert_eq!(app.tabs[0].editor.text(), source);
+        assert!(!app.tabs[0].dirty);
+        assert!(app.tabs[1].path.is_none());
+    }
+}
+
+#[test]
+fn embedded_open_skips_plain_text_and_stale_tree_nodes() {
+    let mut app = App::new(None);
+    load(&mut app, 0, r#"["Not an XML document"]"#, Kind::Json);
+    let tab = app.tabs[0].id;
+    app.open_embedded(tab, 1);
+    assert_eq!(app.tabs.len(), 1);
+    assert_eq!(app.tabs[0].status, "This node does not contain XML");
+
+    load(&mut app, 0, r#"["<root/>"]"#, Kind::Json);
+    app.tabs[0].editor.set_text("[]");
+    app.open_embedded(tab, 1);
+    assert_eq!(app.tabs.len(), 1);
+    assert!(!app.tabs[0].tree_current());
+}
+
+#[test]
 fn worker_reports_io_errors_and_preserves_invalid_source() {
     let directory = unique_path("xmljson-worker");
     fs::create_dir(&directory).unwrap();
