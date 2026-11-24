@@ -1,4 +1,7 @@
-use crate::{document::Document, tree_style};
+use crate::{
+    document::{Document, Kind, LabelStyle},
+    tree_style,
+};
 use eframe::egui::{
     Color32, EventFilter, FontId, Id, Key, Modifiers, ScrollArea, Sense, Shape, Stroke, Ui, pos2,
     vec2,
@@ -18,6 +21,11 @@ pub enum RowKey {
 pub struct Row {
     pub key: RowKey,
     pub depth: usize,
+}
+
+pub enum TreeAction {
+    Select(usize),
+    OpenEmbedded(usize),
 }
 
 #[derive(Default)]
@@ -149,7 +157,14 @@ impl Tree {
 
     pub fn label(&self, key: RowKey) -> Cow<'_, str> {
         match (key, &self.document) {
-            (RowKey::Node(id), Some(document)) => Cow::Borrowed(&document.nodes[id].label),
+            (RowKey::Node(id), Some(document)) => {
+                let node = &document.nodes[id];
+                if matches!(node.label_style, LabelStyle::Xml { .. }) && !node.children.is_empty() {
+                    Cow::Owned(format!("{} ({})", node.label, node.children.len()))
+                } else {
+                    Cow::Borrowed(&node.label)
+                }
+            }
             (RowKey::Group { parent, index }, Some(document)) => {
                 let total = ids(document, parent).len();
                 Cow::Owned(format!(
@@ -223,8 +238,7 @@ impl Tree {
         None
     }
 
-    /// Returns the node chosen by the user, if any.
-    pub fn ui(&mut self, ui: &mut Ui, id: Id) -> Option<usize> {
+    pub fn ui(&mut self, ui: &mut Ui, id: Id) -> Option<TreeAction> {
         ui.painter()
             .rect_filled(ui.available_rect_before_wrap(), 0.0, tree_style::BACKGROUND);
         // Rows have their own ids; this keeps keyboard focus on the tree itself.
@@ -233,7 +247,7 @@ impl Tree {
             id,
             Sense::focusable_noninteractive(),
         );
-        let mut chosen = self.keyboard(ui, id);
+        let mut chosen = self.keyboard(ui, id).map(TreeAction::Select);
         let document = self.document.clone()?;
         let font = FontId::monospace(13.0);
         let row_height = ui.ctx().fonts_mut(|fonts| fonts.row_height(&font)) + 8.0;
@@ -310,6 +324,21 @@ impl Tree {
                     galley,
                     Color32::GRAY,
                 );
+                if enabled
+                    && let RowKey::Node(node) = row.key
+                    && let Some(kind) = document.nodes[node].embedded_kind()
+                {
+                    response.context_menu(|ui| {
+                        let label = match kind {
+                            Kind::Xml => "Open as XML",
+                            Kind::Json => "Open as JSON",
+                        };
+                        if ui.button(label).clicked() {
+                            chosen = Some(TreeAction::OpenEmbedded(node));
+                            ui.close();
+                        }
+                    });
+                }
                 if response.clicked() {
                     ui.ctx().memory_mut(|memory| memory.request_focus(id));
                     let on_arrow = response
@@ -318,7 +347,7 @@ impl Tree {
                     if !on_arrow {
                         self.selected = Some(row.key);
                         if let RowKey::Node(node) = row.key {
-                            chosen = Some(node);
+                            chosen = Some(TreeAction::Select(node));
                         }
                     }
                     if expandable {
@@ -341,13 +370,34 @@ impl Tree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::{self, Kind};
+    use crate::document;
 
     fn tree(text: &str, kind: Kind) -> (Tree, Arc<Document>) {
         let document = Arc::new(document::parse(Arc::from(text), kind, || false).unwrap());
         let mut tree = Tree::default();
         tree.set_document(document.clone());
         (tree, document)
+    }
+
+    #[test]
+    fn xml_labels_count_only_direct_children_and_leave_leaves_unchanged() {
+        let (tree, document) = tree(
+            "<hoteles><hotel><nombre/></hotel><hotel/></hoteles>",
+            Kind::Xml,
+        );
+        let root = document.roots[0];
+        let leaf = document.nodes[root].children[1];
+        assert_eq!(tree.label(RowKey::Node(root)), "<hoteles> (2)");
+        assert_eq!(tree.label(RowKey::Node(leaf)), "<hotel>");
+    }
+
+    #[test]
+    fn json_labels_keep_their_existing_count_without_a_suffix() {
+        let (tree, document) = tree(r#"{"hoteles":[{},{}]}"#, Kind::Json);
+        let root = document.roots[0];
+        let array = document.nodes[root].children[0];
+        assert_eq!(tree.label(RowKey::Node(root)), "{1}");
+        assert_eq!(tree.label(RowKey::Node(array)), "hoteles: [2]");
     }
 
     #[test]
@@ -359,6 +409,7 @@ mod tests {
         text.push_str("</r>");
         let (mut tree, document) = tree(&text, Kind::Xml);
         assert_eq!(tree.rows.len(), 4, "root plus three lazy groups");
+        assert_eq!(tree.label(tree.rows[0].key), "<r> (1100)");
         assert_eq!(tree.label(tree.rows[3].key), "Items 1025–1100");
         let last = document.nodes.len() - 1;
         let index = tree.reveal(last, false).unwrap();

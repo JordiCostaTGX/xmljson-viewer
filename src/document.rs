@@ -65,6 +65,51 @@ pub struct Node {
     pub structural: bool,
 }
 
+impl Node {
+    pub fn embedded_kind(&self) -> Option<Kind> {
+        match self.label_style {
+            LabelStyle::Json {
+                value: ValueStyle::String,
+                ..
+            } => Some(Kind::Xml),
+            LabelStyle::Text => Some(Kind::Json),
+            _ => None,
+        }
+    }
+
+    pub fn embedded_payload(&self, source: &str) -> Option<String> {
+        let kind = self.embedded_kind()?;
+        let payload = match kind {
+            Kind::Xml => {
+                let mut strings = serde_json::Deserializer::from_str(source).into_iter::<String>();
+                let first = strings.next()?.ok()?;
+                if let Some(value) = source[strings.byte_offset()..]
+                    .trim_start()
+                    .strip_prefix(':')
+                {
+                    serde_json::from_str(value).ok()?
+                } else {
+                    first
+                }
+            }
+            Kind::Json => match Reader::from_str(source).read_event().ok()? {
+                Event::Text(text) => text.unescape().ok()?.into_owned(),
+                Event::CData(text) => std::str::from_utf8(&text).ok()?.to_owned(),
+                _ => return None,
+            },
+        };
+        let start = payload
+            .trim_start()
+            .trim_start_matches('\u{feff}')
+            .trim_start();
+        match kind {
+            Kind::Xml if start.starts_with('<') => Some(start.to_owned()),
+            Kind::Json if start.starts_with(['{', '[']) => Some(start.to_owned()),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Document {
     pub nodes: Vec<Node>,
