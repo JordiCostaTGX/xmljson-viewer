@@ -10,7 +10,63 @@ mod tree_style;
 mod ui;
 
 use document::Kind;
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Instant};
+use ui::RendererChoice;
+
+fn parse_launch_args(args: Vec<OsString>) -> (RendererChoice, Vec<PathBuf>) {
+    let mut choice = std::env::var("XMLJSON_RENDERER")
+        .ok()
+        .and_then(|value| RendererChoice::parse(&value))
+        .unwrap_or(RendererChoice::Auto);
+    let mut files = Vec::new();
+    let mut literal_only = false;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        if !literal_only && let Some(text) = arg.to_str() {
+            if text == "--" {
+                literal_only = true;
+                continue;
+            }
+            if let Some(value) = text.strip_prefix("--renderer=")
+                && let Some(parsed) = RendererChoice::parse(value)
+            {
+                choice = parsed;
+                continue;
+            }
+            if text == "--renderer" {
+                if let Some(next) = iter.next() {
+                    if let Some(parsed) = next.to_str().and_then(RendererChoice::parse) {
+                        choice = parsed;
+                    } else {
+                        files.push(PathBuf::from(next));
+                    }
+                }
+                continue;
+            }
+            match text {
+                "--gl" | "--glow" => {
+                    choice = RendererChoice::Glow;
+                    continue;
+                }
+                "--dx12" => {
+                    choice = RendererChoice::WgpuDx12;
+                    continue;
+                }
+                "--wgpu" => {
+                    choice = RendererChoice::Wgpu;
+                    continue;
+                }
+                "--software" => {
+                    choice = RendererChoice::WgpuSoftware;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        files.push(PathBuf::from(arg));
+    }
+    (choice, files)
+}
 
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -26,8 +82,11 @@ fn main() {
         return;
     }
     diagnostics::initialize();
-    let files: Vec<PathBuf> = args.into_iter().map(PathBuf::from).collect();
-    diagnostics::record(&format!("Open requests: {} file(s)", files.len()));
+    let (renderer_choice, files) = parse_launch_args(args);
+    diagnostics::record(&format!(
+        "Open requests: {} file(s); renderer preference: {renderer_choice:?}",
+        files.len()
+    ));
     let (incoming, requests) = std::sync::mpsc::channel();
     diagnostics::record("Initializing single-instance listener or forwarding request");
     match single_instance::forward_or_start(files.clone(), incoming) {
@@ -42,7 +101,7 @@ fn main() {
         }
     }
     diagnostics::record("Initializing window and graphics renderer");
-    if let Err(error) = ui::run(files, requests) {
+    if let Err(error) = ui::run(files, requests, renderer_choice) {
         diagnostics::report_error(&format!(
             "Window or graphics initialization failed: {error}"
         ));
@@ -95,4 +154,31 @@ fn peak_rss_kib() -> Option<u64> {
         .next()?
         .parse()
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_launch_args_extracts_renderer_flags_and_keeps_files() {
+        let (choice, files) = parse_launch_args(vec![
+            OsString::from("--gl"),
+            OsString::from("sample.json"),
+            OsString::from("--"),
+            OsString::from("--dx12"),
+        ]);
+        assert_eq!(choice, RendererChoice::Glow);
+        assert_eq!(
+            files,
+            vec![PathBuf::from("sample.json"), PathBuf::from("--dx12")]
+        );
+
+        let (choice, files) = parse_launch_args(vec![
+            OsString::from("--renderer=software"),
+            OsString::from("audit.xml"),
+        ]);
+        assert_eq!(choice, RendererChoice::WgpuSoftware);
+        assert_eq!(files, vec![PathBuf::from("audit.xml")]);
+    }
 }

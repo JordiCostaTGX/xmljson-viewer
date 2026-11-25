@@ -441,3 +441,43 @@ fn renders_frames_headless() {
     assert_eq!(app.title, "XML/JSON Viewer — Untitled");
     assert!(app.tabs[0].editor.match_count() > 1100);
 }
+
+#[test]
+fn startup_plan_orders_dx12_glow_and_software_fallbacks() {
+    assert_eq!(
+        startup_plan(RendererChoice::Auto, None, true),
+        vec![
+            StartupAttempt::WgpuDx12,
+            StartupAttempt::Glow,
+            StartupAttempt::WgpuSoftware,
+        ]
+    );
+    assert_eq!(
+        startup_plan(RendererChoice::Auto, Some("wgpu-dx12"), true),
+        vec![
+            StartupAttempt::Glow,
+            StartupAttempt::WgpuSoftware,
+            StartupAttempt::WgpuDx12,
+        ]
+    );
+    assert_eq!(
+        startup_plan(RendererChoice::Auto, Some("glow"), true),
+        vec![
+            StartupAttempt::WgpuSoftware,
+            StartupAttempt::WgpuDx12,
+            StartupAttempt::Glow,
+        ]
+    );
+    assert_eq!(
+        startup_plan(RendererChoice::Auto, None, false),
+        vec![StartupAttempt::WgpuDefault, StartupAttempt::Glow]
+    );
+    assert_eq!(
+        startup_plan(RendererChoice::Glow, None, true),
+        vec![StartupAttempt::Glow]
+    );
+    assert_eq!(
+        startup_plan(RendererChoice::WgpuSoftware, None, true),
+        vec![StartupAttempt::WgpuSoftware]
+    );
+}

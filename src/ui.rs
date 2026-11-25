@@ -13,8 +13,8 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -1095,10 +1095,140 @@ impl eframe::App for App {
     }
 }
 
-pub fn run(files: Vec<PathBuf>, requests: mpsc::Receiver<Vec<PathBuf>>) -> eframe::Result {
-    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../resources/visor-mascot.png"))
-        .expect("Embedded viewer icon must be a valid PNG");
-    let options = eframe::NativeOptions {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RendererChoice {
+    #[default]
+    Auto,
+    Wgpu,
+    WgpuDx12,
+    WgpuSoftware,
+    Glow,
+}
+
+impl RendererChoice {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "wgpu" => Some(Self::Wgpu),
+            "dx12" => Some(Self::WgpuDx12),
+            "software" | "warp" => Some(Self::WgpuSoftware),
+            "gl" | "glow" | "opengl" => Some(Self::Glow),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupAttempt {
+    WgpuDefault,
+    WgpuDx12,
+    WgpuSoftware,
+    Glow,
+}
+
+impl StartupAttempt {
+    fn id(self) -> &'static str {
+        match self {
+            Self::WgpuDefault => "wgpu",
+            Self::WgpuDx12 => "wgpu-dx12",
+            Self::WgpuSoftware => "wgpu-software",
+            Self::Glow => "glow",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::WgpuDefault => "wgpu (default)",
+            Self::WgpuDx12 => "wgpu (DX12 / WARP fallback)",
+            Self::WgpuSoftware => "wgpu (software / WARP)",
+            Self::Glow => "OpenGL (glow)",
+        }
+    }
+}
+
+fn startup_plan(
+    choice: RendererChoice,
+    previous_crash: Option<&str>,
+    is_windows: bool,
+) -> Vec<StartupAttempt> {
+    match choice {
+        RendererChoice::Wgpu => return vec![StartupAttempt::WgpuDefault],
+        RendererChoice::WgpuDx12 => return vec![StartupAttempt::WgpuDx12],
+        RendererChoice::WgpuSoftware => return vec![StartupAttempt::WgpuSoftware],
+        RendererChoice::Glow => return vec![StartupAttempt::Glow],
+        RendererChoice::Auto => {}
+    }
+    if is_windows {
+        match previous_crash {
+            Some("wgpu-dx12") | Some("wgpu") => vec![
+                StartupAttempt::Glow,
+                StartupAttempt::WgpuSoftware,
+                StartupAttempt::WgpuDx12,
+            ],
+            Some("glow") => vec![
+                StartupAttempt::WgpuSoftware,
+                StartupAttempt::WgpuDx12,
+                StartupAttempt::Glow,
+            ],
+            _ => vec![
+                StartupAttempt::WgpuDx12,
+                StartupAttempt::Glow,
+                StartupAttempt::WgpuSoftware,
+            ],
+        }
+    } else {
+        match previous_crash {
+            Some("wgpu") => vec![StartupAttempt::Glow, StartupAttempt::WgpuDefault],
+            _ => vec![StartupAttempt::WgpuDefault, StartupAttempt::Glow],
+        }
+    }
+}
+
+fn select_wgpu_adapter(
+    adapters: &[eframe::wgpu::Adapter],
+    surface: Option<&eframe::wgpu::Surface<'_>>,
+    software_only: bool,
+) -> Result<eframe::wgpu::Adapter, String> {
+    use eframe::wgpu::DeviceType;
+
+    let mut best: Option<(u8, &eframe::wgpu::Adapter)> = None;
+    for adapter in adapters {
+        if let Some(surface) = surface
+            && !adapter.is_surface_supported(surface)
+        {
+            continue;
+        }
+        let info = adapter.get_info();
+        if software_only && info.device_type != DeviceType::Cpu {
+            continue;
+        }
+        let rank = match info.device_type {
+            DeviceType::IntegratedGpu => 0,
+            DeviceType::DiscreteGpu => 1,
+            DeviceType::VirtualGpu => 2,
+            DeviceType::Other => 3,
+            DeviceType::Cpu => 4,
+        };
+        if best.is_none_or(|(best_rank, _)| rank < best_rank) {
+            best = Some((rank, adapter));
+        }
+    }
+    if let Some((_, adapter)) = best {
+        let info = adapter.get_info();
+        crate::diagnostics::record(&format!(
+            "Selected graphics adapter: {} ({:?}, {:?})",
+            info.name, info.backend, info.device_type
+        ));
+        Ok(adapter.clone())
+    } else if software_only {
+        Err("No compatible software graphics adapter found".into())
+    } else {
+        Err("No compatible graphics adapter found".into())
+    }
+}
+
+fn native_options(icon: eframe::egui::IconData, attempt: StartupAttempt) -> eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_TITLE)
             .with_app_id(APP_ID)
@@ -1108,21 +1238,136 @@ pub fn run(files: Vec<PathBuf>, requests: mpsc::Receiver<Vec<PathBuf>>) -> efram
             .with_drag_and_drop(true),
         ..Default::default()
     };
-    eframe::run_native(
-        APP_TITLE,
-        options,
-        Box::new(move |creation| {
-            crate::diagnostics::record("Window and graphics context created; initializing editor");
-            creation.egui_ctx.set_theme(ThemePreference::Dark);
-            #[cfg(target_os = "windows")]
-            set_native_dark_titlebar(creation);
-            let mut app = App::new(Some(creation.egui_ctx.clone()));
-            app.open_requests = Some(requests);
-            for path in files {
-                app.open(path);
+    match attempt {
+        StartupAttempt::Glow => {
+            options.renderer = eframe::Renderer::Glow;
+        }
+        StartupAttempt::WgpuDefault => {
+            options.renderer = eframe::Renderer::Wgpu;
+            if let eframe::egui_wgpu::WgpuSetup::CreateNew(ref mut setup) =
+                options.wgpu_options.wgpu_setup
+            {
+                setup.power_preference = eframe::wgpu::PowerPreference::from_env()
+                    .unwrap_or(eframe::wgpu::PowerPreference::LowPower);
+                setup.native_adapter_selector = Some(Arc::new(|adapters, surface| {
+                    select_wgpu_adapter(adapters, surface, false)
+                }));
             }
-            crate::diagnostics::record("Editor initialized");
-            Ok(Box::new(app))
-        }),
-    )
+        }
+        StartupAttempt::WgpuDx12 => {
+            options.renderer = eframe::Renderer::Wgpu;
+            if let eframe::egui_wgpu::WgpuSetup::CreateNew(ref mut setup) =
+                options.wgpu_options.wgpu_setup
+            {
+                // On Windows, avoid probing Vulkan/WGL by default because faulty
+                // Vulkan ICDs (e.g. older Intel/hybrid drivers) can cause native
+                // access violations during adapter enumeration.
+                setup.instance_descriptor.backends =
+                    eframe::wgpu::Backends::from_env().unwrap_or(eframe::wgpu::Backends::DX12);
+                setup.power_preference = eframe::wgpu::PowerPreference::from_env()
+                    .unwrap_or(eframe::wgpu::PowerPreference::LowPower);
+                setup.native_adapter_selector = Some(Arc::new(|adapters, surface| {
+                    select_wgpu_adapter(adapters, surface, false)
+                }));
+            }
+        }
+        StartupAttempt::WgpuSoftware => {
+            options.renderer = eframe::Renderer::Wgpu;
+            if let eframe::egui_wgpu::WgpuSetup::CreateNew(ref mut setup) =
+                options.wgpu_options.wgpu_setup
+            {
+                setup.instance_descriptor.backends =
+                    eframe::wgpu::Backends::from_env().unwrap_or(eframe::wgpu::Backends::DX12);
+                setup.native_adapter_selector = Some(Arc::new(|adapters, surface| {
+                    select_wgpu_adapter(adapters, surface, true)
+                }));
+            }
+        }
+    }
+    options
+}
+
+pub fn run(
+    files: Vec<PathBuf>,
+    requests: mpsc::Receiver<Vec<PathBuf>>,
+    choice: RendererChoice,
+) -> eframe::Result {
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../resources/visor-mascot.png"))
+        .expect("Embedded viewer icon must be a valid PNG");
+    let previous_crash = crate::diagnostics::previous_graphics_init_failure();
+    if let Some(failed) = &previous_crash {
+        crate::diagnostics::record(&format!(
+            "Previous launch did not finish graphics initialization ({failed}); prioritizing fallback renderer"
+        ));
+    }
+    let plan = startup_plan(
+        choice,
+        previous_crash.as_deref(),
+        cfg!(target_os = "windows"),
+    );
+    let requests = Arc::new(Mutex::new(Some(requests)));
+    let mut last_error: Option<eframe::Error> = None;
+
+    for (index, attempt) in plan.iter().copied().enumerate() {
+        crate::diagnostics::record(&format!(
+            "Trying graphics backend {}/{}: {}",
+            index + 1,
+            plan.len(),
+            attempt.description()
+        ));
+        crate::diagnostics::mark_graphics_init_started(attempt.id());
+
+        let options = native_options(icon.clone(), attempt);
+        let files_for_attempt = files.clone();
+        let requests_for_attempt = requests.clone();
+        let initialized = Arc::new(AtomicBool::new(false));
+        let initialized_flag = initialized.clone();
+
+        let result = eframe::run_native(
+            APP_TITLE,
+            options,
+            Box::new(move |creation| {
+                crate::diagnostics::mark_graphics_init_succeeded();
+                initialized_flag.store(true, Ordering::Relaxed);
+                crate::diagnostics::record(&format!(
+                    "Window and graphics context created ({}); initializing editor",
+                    attempt.description()
+                ));
+                creation.egui_ctx.set_theme(ThemePreference::Dark);
+                #[cfg(target_os = "windows")]
+                set_native_dark_titlebar(creation);
+                let mut app = App::new(Some(creation.egui_ctx.clone()));
+                app.open_requests = requests_for_attempt
+                    .lock()
+                    .ok()
+                    .and_then(|mut guard| guard.take());
+                for path in files_for_attempt {
+                    app.open(path);
+                }
+                crate::diagnostics::record("Editor initialized");
+                Ok(Box::new(app))
+            }),
+        );
+
+        match result {
+            Ok(()) => {
+                crate::diagnostics::mark_graphics_init_succeeded();
+                return Ok(());
+            }
+            Err(error) => {
+                crate::diagnostics::record(&format!(
+                    "Graphics backend {} failed: {error}",
+                    attempt.description()
+                ));
+                if initialized.load(Ordering::Relaxed) {
+                    return Err(error);
+                }
+                crate::diagnostics::mark_graphics_init_succeeded();
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| eframe::Error::AppCreation(Box::from("No graphics backend succeeded"))))
 }

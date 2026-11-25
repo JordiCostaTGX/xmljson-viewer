@@ -11,7 +11,8 @@ include = [
 ]
 
 [dependencies]
-eframe = "0.37"
+eframe = { version = "0.37", features = ["glow"] }
+log = "0.4"
 rfd = "0.18"
 ropey = { version = "1.6", default-features = false, features = ["simd", "cr_lines"] }
 quick-xml = "0.37"
@@ -22,7 +23,12 @@ regex = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle = "0.6"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
