@@ -1,5 +1,6 @@
 use crate::{
     document::{Document, Kind, LabelStyle},
+    theme::Palette,
     tree_style,
 };
 use eframe::egui::{
@@ -238,9 +239,9 @@ impl Tree {
         None
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, id: Id) -> Option<TreeAction> {
+    pub fn ui(&mut self, ui: &mut Ui, id: Id, palette: &Palette) -> Option<TreeAction> {
         ui.painter()
-            .rect_filled(ui.available_rect_before_wrap(), 0.0, tree_style::BACKGROUND);
+            .rect_filled(ui.available_rect_before_wrap(), 0.0, palette.background);
         // Rows have their own ids; this keeps keyboard focus on the tree itself.
         ui.interact(
             ui.available_rect_before_wrap(),
@@ -280,9 +281,9 @@ impl Tree {
                     }
                 };
                 if self.selected == Some(row.key) {
-                    painter.rect_filled(rect, 4.0, tree_style::SELECTED);
+                    painter.rect_filled(rect, 4.0, palette.tree_selected);
                 } else if response.hovered() {
-                    painter.rect_filled(rect, 4.0, tree_style::HOVER);
+                    painter.rect_filled(rect, 4.0, palette.tree_hover);
                 }
                 let left = rect.left() + 6.0 + row.depth as f32 * INDENT;
                 let center = rect.center().y;
@@ -303,7 +304,7 @@ impl Tree {
                     };
                     painter.add(Shape::convex_polygon(
                         points,
-                        fade(tree_style::EXPANDER),
+                        fade(palette.key),
                         Stroke::NONE,
                     ));
                 }
@@ -312,7 +313,7 @@ impl Tree {
                     RowKey::Node(node) => Some(&document.nodes[node].label_style),
                     RowKey::Group { .. } => None,
                 };
-                let mut job = tree_style::job(&label, style, font.clone());
+                let mut job = tree_style::job(&label, style, font.clone(), palette);
                 if !enabled {
                     for section in &mut job.sections {
                         section.format.color = fade(section.format.color);
@@ -477,7 +478,7 @@ mod tests {
                 ..Default::default()
             };
             ctx.run_ui(input, |ui| {
-                if let Some(action) = tree.ui(ui, id) {
+                if let Some(action) = tree.ui(ui, id, &crate::theme::DARK) {
                     chosen = Some(action);
                 }
             })

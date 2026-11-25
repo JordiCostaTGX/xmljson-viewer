@@ -1,6 +1,7 @@
 use crate::{
     document::Kind,
-    syntax::{self, State, Style},
+    syntax::{self, State},
+    theme::{self, Palette},
 };
 use eframe::egui::{
     self, Align, Align2, Button, Color32, Context, CursorIcon, Event, EventFilter, FontId, Galley,
@@ -18,26 +19,6 @@ const WINDOW: usize = 1024;
 const WINDOW_SPAN: usize = 4096;
 const MAX_UNDO: usize = 1000;
 const FONT_SIZE: f32 = 14.0;
-
-pub const BACKGROUND: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x1e);
-const TEXT: Color32 = Color32::from_rgb(0xd4, 0xd4, 0xd4);
-const LINE_NUMBER: Color32 = Color32::from_rgb(0x85, 0x85, 0x85);
-const CURRENT_LINE_NUMBER: Color32 = Color32::from_rgb(0xc6, 0xc6, 0xc6);
-const CURRENT_LINE: Color32 = Color32::from_rgb(0x28, 0x2a, 0x2e);
-const SELECTION: Color32 = Color32::from_rgb(0x26, 0x4f, 0x78);
-const MATCH: Color32 = Color32::from_rgb(0x61, 0x3a, 0x14);
-const CARET: Color32 = Color32::from_rgb(0xae, 0xaf, 0xad);
-
-pub fn color(style: Style) -> Color32 {
-    match style {
-        Style::Key | Style::Attribute => Color32::from_rgb(0x9c, 0xdc, 0xfe),
-        Style::String => Color32::from_rgb(0xce, 0x91, 0x78),
-        Style::Number => Color32::from_rgb(0xb5, 0xce, 0xa8),
-        Style::Literal | Style::Tag => Color32::from_rgb(0x56, 0x9c, 0xd6),
-        Style::Comment => Color32::from_rgb(0x6a, 0x99, 0x55),
-        Style::Punctuation => Color32::from_rgb(0x80, 0x80, 0x80),
-    }
-}
 
 struct Edit {
     start: usize,
@@ -99,6 +80,7 @@ pub struct Editor {
     matches: Vec<Range<usize>>,
     matches_version: u64,
     page_rows: usize,
+    palette: &'static Palette,
 }
 
 impl Default for Editor {
@@ -123,6 +105,7 @@ impl Default for Editor {
             matches: vec![],
             matches_version: u64::MAX,
             page_rows: 20,
+            palette: &theme::DARK,
         }
     }
 }
@@ -744,6 +727,7 @@ impl Editor {
             Some(Kind::Json) => syntax::json(&chars),
             None => vec![],
         };
+        let palette = self.palette;
         let mut job = LayoutJob::default();
         let mut append = |from: usize, to: usize, color: Color32| {
             if from < to {
@@ -761,11 +745,11 @@ impl Editor {
             }
             let from = span.range.start.max(at);
             let to = span.range.end.min(end);
-            append(at, from, TEXT);
-            append(from, to, color(span.style));
+            append(at, from, palette.text);
+            append(from, to, palette.syntax(span.style));
             at = to;
         }
-        append(at, end, TEXT);
+        append(at, end, palette.text);
         let galley = ctx.fonts_mut(|fonts| fonts.layout_job(job));
         let layout = LineLayout {
             start,
@@ -812,7 +796,11 @@ impl Editor {
         column.min(layout.len)
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, id: Id, request_focus: bool) {
+    pub fn ui(&mut self, ui: &mut Ui, id: Id, request_focus: bool, palette: &'static Palette) {
+        if !std::ptr::eq(self.palette, palette) {
+            self.palette = palette;
+            self.layouts.clear();
+        }
         let ctx = ui.ctx().clone();
         let font = FontId::monospace(FONT_SIZE);
         let (row_height, char_width) =
@@ -844,7 +832,7 @@ impl Editor {
             lines as f32 * row_height,
         );
         ui.painter()
-            .rect_filled(ui.available_rect_before_wrap(), 0.0, BACKGROUND);
+            .rect_filled(ui.available_rect_before_wrap(), 0.0, palette.background);
         ScrollArea::both()
             .id_salt(id)
             .auto_shrink(false)
@@ -954,7 +942,7 @@ impl Editor {
                                 pos2(clip.max.x, y + row_height),
                             ),
                             0.0,
-                            CURRENT_LINE,
+                            palette.current_line,
                         );
                     }
                     let first_match = self.matches.partition_point(|m| m.end <= start);
@@ -969,7 +957,7 @@ impl Editor {
                             found.end.min(end) - start,
                             false,
                         );
-                        painter.rect_filled(rect, 2.0, MATCH);
+                        painter.rect_filled(rect, 2.0, palette.search_match);
                     }
                     if !selection.is_empty() && selection.start <= end && selection.end > start {
                         let rect = span_rect(
@@ -979,12 +967,12 @@ impl Editor {
                             selection.end.min(end) - start,
                             selection.end > end,
                         );
-                        painter.rect_filled(rect, 0.0, SELECTION);
+                        painter.rect_filled(rect, 0.0, palette.selection);
                     }
                     painter.galley(
                         pos2(text_left + layout.window as f32 * char_width, y),
                         layout.galley,
-                        TEXT,
+                        palette.text,
                     );
                 }
 
@@ -996,7 +984,7 @@ impl Editor {
                     pos2(caret_x + 2.0, caret_y + row_height),
                 );
                 if focused {
-                    painter.rect_filled(caret, 0.0, CARET);
+                    painter.rect_filled(caret, 0.0, palette.caret);
                     let to_global = ctx
                         .layer_transform_to_global(ui.layer_id())
                         .unwrap_or_default();
@@ -1012,7 +1000,8 @@ impl Editor {
 
                 let gutter_rect =
                     Rect::from_min_max(clip.min, pos2(clip.min.x + gutter, clip.max.y));
-                ui.painter().rect_filled(gutter_rect, 0.0, BACKGROUND);
+                ui.painter()
+                    .rect_filled(gutter_rect, 0.0, palette.background);
                 for line in first..last {
                     let y = origin.y + line as f32 * row_height + row_height * 0.5;
                     ui.painter().text(
@@ -1021,9 +1010,9 @@ impl Editor {
                         line + 1,
                         font.clone(),
                         if line == cursor_line {
-                            CURRENT_LINE_NUMBER
+                            palette.current_line_number
                         } else {
-                            LINE_NUMBER
+                            palette.line_number
                         },
                     );
                 }
@@ -1240,7 +1229,7 @@ mod tests {
                 events,
                 ..Default::default()
             };
-            ctx.run_ui(input, |ui| editor.ui(ui, id, false))
+            ctx.run_ui(input, |ui| editor.ui(ui, id, false, &theme::DARK))
                 .textures_delta
                 .clear();
         };

@@ -1,13 +1,11 @@
 use crate::{
     document::{self, Document, Kind},
-    editor::{self, Editor},
+    editor::Editor,
     settings::{self, Settings},
+    theme::Theme,
     tree::Tree,
-    tree_style,
 };
-use eframe::egui::{
-    self, Align, Id, Key, KeyboardShortcut, Layout, Modifiers, ThemePreference, ViewportCommand,
-};
+use eframe::egui::{self, Align, Id, Key, KeyboardShortcut, Layout, Modifiers, ViewportCommand};
 use std::{
     ffi::OsString,
     fs, io,
@@ -33,22 +31,29 @@ const REPLACE_ID: &str = "replace-input";
 const TREE_MIN_WIDTH: f32 = 160.0;
 
 #[cfg(target_os = "windows")]
-fn set_native_dark_titlebar(creation: &eframe::CreationContext<'_>) {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+fn set_native_titlebar(
+    window: &impl raw_window_handle::HasWindowHandle,
+    palette: &crate::theme::Palette,
+) {
+    use raw_window_handle::RawWindowHandle;
     use windows_sys::Win32::Graphics::Dwm::{
         DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
     };
 
-    let Ok(handle) = creation.window_handle() else {
+    let Ok(handle) = window.window_handle() else {
         return;
     };
     let RawWindowHandle::Win32(handle) = handle.as_raw() else {
         return;
     };
     let hwnd = handle.hwnd.get() as _;
-    let enabled = 1i32;
-    let caption_color = 0u32;
-    let text_color = 0x00ff_ffffu32;
+    let enabled = i32::from(palette.dark);
+    // COLORREF is 0x00BBGGRR.
+    let colorref = |color: egui::Color32| {
+        u32::from(color.r()) | (u32::from(color.g()) << 8) | (u32::from(color.b()) << 16)
+    };
+    let caption_color = colorref(palette.panel);
+    let text_color = colorref(palette.text);
     unsafe {
         let result = DwmSetWindowAttribute(
             hwnd,
@@ -388,6 +393,8 @@ pub struct App {
     tree_resized: bool,
     open_files_in_new_window: bool,
     persist_settings: bool,
+    theme: Theme,
+    applied_theme: Option<Theme>,
 }
 
 fn spawn_window(files: &[PathBuf]) -> io::Result<()> {
@@ -440,6 +447,8 @@ impl App {
             tree_resized: false,
             open_files_in_new_window: false,
             persist_settings: false,
+            theme: Theme::default(),
+            applied_theme: None,
         };
         app.new_tab();
         app
@@ -449,6 +458,7 @@ impl App {
         self.tree_width = settings.tree_width.max(TREE_MIN_WIDTH);
         self.open_files_in_new_window = settings.open_files_in_new_window;
         self.search_case_sensitive = settings.search_case_sensitive;
+        self.theme = Theme::from_id(&settings.theme);
         self.persist_settings = true;
     }
 
@@ -1010,6 +1020,17 @@ impl App {
 
     fn show(&mut self, ui: &mut egui::Ui, frame: Option<&eframe::Frame>) {
         let ctx = ui.ctx().clone();
+        if self.applied_theme != Some(self.theme) {
+            self.theme.apply(&ctx);
+            #[cfg(target_os = "windows")]
+            if let Some(frame) = frame {
+                set_native_titlebar(frame, self.theme.palette());
+            }
+            self.applied_theme = Some(self.theme);
+            // This frame's Ui was created with the previous style.
+            ctx.request_repaint();
+        }
+        let palette = self.theme.palette();
         self.poll();
         self.receive_open_requests(&ctx);
         let dropped: Vec<PathBuf> = ctx.input(|input| {
@@ -1079,6 +1100,16 @@ impl App {
                         let value = self.search_case_sensitive;
                         settings::update(|settings| settings.search_case_sensitive = value);
                     }
+                    ui.menu_button("Theme", |ui| {
+                        for theme in Theme::ALL {
+                            if ui.radio(self.theme == theme, theme.name()).clicked() {
+                                self.theme = theme;
+                                if self.persist_settings {
+                                    settings::update(|settings| settings.theme = theme.id().into());
+                                }
+                            }
+                        }
+                    });
                 });
             });
             egui::ScrollArea::horizontal()
@@ -1222,10 +1253,12 @@ impl App {
             .resizable(true)
             .default_size(self.tree_width)
             .min_size(TREE_MIN_WIDTH)
-            .frame(egui::Frame::NONE.fill(tree_style::BACKGROUND))
+            .frame(egui::Frame::NONE.fill(palette.background))
             .show(ui, |ui| {
                 let chosen = ui
-                    .add_enabled_ui(current, |ui| tab.tree.ui(ui, Id::unique(("tree", tab.id))))
+                    .add_enabled_ui(current, |ui| {
+                        tab.tree.ui(ui, Id::unique(("tree", tab.id)), palette)
+                    })
                     .inner;
                 match chosen {
                     Some(crate::tree::TreeAction::Select(id)) => tab.select_node(id),
@@ -1250,9 +1283,10 @@ impl App {
         }
         let focus = self.dialog.is_none() && std::mem::take(&mut self.focus_editor);
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(editor::BACKGROUND))
+            .frame(egui::Frame::NONE.fill(palette.background))
             .show(ui, |ui| {
-                tab.editor.ui(ui, Id::unique(("editor", tab.id)), focus);
+                tab.editor
+                    .ui(ui, Id::unique(("editor", tab.id)), focus, palette);
             });
 
         if !actions.is_empty() {
@@ -1547,11 +1581,13 @@ pub fn run(
                     "Window and graphics context created ({}); initializing editor",
                     attempt.description()
                 ));
-                creation.egui_ctx.set_theme(ThemePreference::Dark);
-                #[cfg(target_os = "windows")]
-                set_native_dark_titlebar(creation);
                 let mut app = App::new(Some(creation.egui_ctx.clone()));
                 app.apply_settings(settings_for_attempt);
+                // Applied before the first frame so the window does not flash the default theme.
+                app.theme.apply(&creation.egui_ctx);
+                #[cfg(target_os = "windows")]
+                set_native_titlebar(creation, app.theme.palette());
+                app.applied_theme = Some(app.theme);
                 app.open_requests = requests_for_attempt
                     .lock()
                     .ok()
