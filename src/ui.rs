@@ -88,7 +88,8 @@ enum Task {
     Parse(Arc<str>, Kind),
     Open(PathBuf),
     Format(Arc<str>, Kind),
-    Decode(String, String, usize, usize),
+    /// Selected text, whole source, selected char range, and whether it was triggered by opening.
+    Decode(String, String, usize, usize, bool),
     Save(PathBuf, String),
 }
 
@@ -108,7 +109,7 @@ enum Output {
         Option<Arc<str>>,
     ),
     Formatted(Result<String, String>),
-    Decoded(Result<Option<String>, String>, usize, usize),
+    Decoded(Result<Option<String>, String>, usize, usize, bool),
     Saved(PathBuf, Result<(), String>),
 }
 
@@ -170,7 +171,7 @@ fn worker(notify: impl Fn() + Send + 'static) -> (mpsc::Sender<Job>, mpsc::Recei
                     ),
                 },
                 Task::Format(text, kind) => Output::Formatted(document::format(&text, kind)),
-                Task::Decode(selected, source, start, end) => {
+                Task::Decode(selected, source, start, end, on_open) => {
                     let source_len = source.chars().count();
                     let decoded = document::decode(&selected).and_then(|decoded| {
                         decoded
@@ -180,7 +181,7 @@ fn worker(notify: impl Fn() + Send + 'static) -> (mpsc::Sender<Job>, mpsc::Recei
                             })
                             .transpose()
                     });
-                    Output::Decoded(decoded, 0, source_len)
+                    Output::Decoded(decoded, 0, source_len, on_open)
                 }
                 Task::Save(path, text) => {
                     let result =
@@ -363,6 +364,8 @@ enum Action {
     SelectAll,
     ParseXml,
     ParseJson,
+    ExpandAll,
+    CollapseAll,
     Decode,
 }
 
@@ -382,6 +385,7 @@ pub struct App {
     search_visible: bool,
     search_query: String,
     search_case_sensitive: bool,
+    decode_on_open: bool,
     replace_visible: bool,
     replace_text: String,
     focus_search: bool,
@@ -436,6 +440,7 @@ impl App {
             search_visible: false,
             search_query: String::new(),
             search_case_sensitive: true,
+            decode_on_open: false,
             replace_visible: false,
             replace_text: String::new(),
             focus_search: false,
@@ -458,6 +463,7 @@ impl App {
         self.tree_width = settings.tree_width.max(TREE_MIN_WIDTH);
         self.open_files_in_new_window = settings.open_files_in_new_window;
         self.search_case_sensitive = settings.search_case_sensitive;
+        self.decode_on_open = settings.decode_on_open;
         self.theme = Theme::from_id(&settings.theme);
         self.persist_settings = true;
     }
@@ -608,6 +614,7 @@ impl App {
         if reply.revision != tab.revision() && !matches!(reply.output, Output::Saved(..)) {
             return;
         }
+        let mut decode_opened = false;
         match reply.output {
             Output::Parsed(parsed) => tab.install_document(reply.revision, parsed),
             Output::Opened(path, kind, parsed, content) => {
@@ -619,6 +626,7 @@ impl App {
                     tab.path = Some(path);
                     tab.dirty = false;
                     tab.install_document(reply.revision, parsed);
+                    decode_opened = self.decode_on_open && !content.is_empty();
                 } else if let Err(error) = parsed {
                     tab.status = error;
                 }
@@ -633,12 +641,22 @@ impl App {
                         .into();
             }
             Output::Formatted(Err(error)) => tab.status = format!("Formatting error: {error}"),
-            Output::Decoded(Ok(Some(text)), start, end) => {
+            Output::Decoded(Ok(Some(text)), start, end, on_open) => {
                 tab.editor.replace(start..end, &text);
                 tab.note_changes(Instant::now());
-                tab.status = "Selection decoded and document structured".into();
+                if on_open {
+                    // The file on disk is untouched, so closing needs no confirmation.
+                    tab.dirty = false;
+                    tab.status = "Decoded on open; Ctrl+Z restores the original text".into();
+                } else {
+                    tab.status = "Selection decoded and document structured".into();
+                }
             }
-            Output::Decoded(Ok(None), ..) => tab.status = "No escaped content to decode".into(),
+            Output::Decoded(Ok(None), .., on_open) => {
+                if !on_open {
+                    tab.status = "No escaped content to decode".into();
+                }
+            }
             Output::Decoded(Err(error), ..) => tab.status = format!("Decode error: {error}"),
             Output::Saved(path, result) => {
                 tab.saving = false;
@@ -663,6 +681,12 @@ impl App {
                     }
                 }
             }
+        }
+        if decode_opened {
+            let tab = &self.tabs[index];
+            let source = tab.editor.text();
+            let end = tab.editor.len_chars();
+            self.submit(index, Task::Decode(source.clone(), source, 0, end, true));
         }
     }
 
@@ -879,7 +903,7 @@ impl App {
                 if text.is_empty() {
                     tab.status = "No text to decode".into();
                 } else {
-                    self.submit(index, Task::Decode(text, source, start, end));
+                    self.submit(index, Task::Decode(text, source, start, end, false));
                 }
             }
             Action::Undo => {
@@ -891,6 +915,8 @@ impl App {
             Action::SelectAll => self.tabs[index].editor.select_all(),
             Action::ParseXml => self.parse(index, Some(Kind::Xml)),
             Action::ParseJson => self.parse(index, Some(Kind::Json)),
+            Action::ExpandAll => self.tabs[index].tree.expand_all(),
+            Action::CollapseAll => self.tabs[index].tree.collapse_all(),
         }
     }
 
@@ -1100,6 +1126,16 @@ impl App {
                         let value = self.search_case_sensitive;
                         settings::update(|settings| settings.search_case_sensitive = value);
                     }
+                    let response = ui
+                        .checkbox(&mut self.decode_on_open, "Decode files on open")
+                        .on_hover_text(
+                            "Opened files are decoded and structured as with Decode; \
+                             Ctrl+Z restores the original text",
+                        );
+                    if response.changed() && self.persist_settings {
+                        let value = self.decode_on_open;
+                        settings::update(|settings| settings.decode_on_open = value);
+                    }
                     ui.menu_button("Theme", |ui| {
                         for theme in Theme::ALL {
                             if ui.radio(self.theme == theme, theme.name()).clicked() {
@@ -1152,6 +1188,8 @@ impl App {
                     ("Parse to JSON", Action::ParseJson),
                     ("Parse to XML", Action::ParseXml),
                     ("New tab", Action::New),
+                    ("Collapse all", Action::CollapseAll),
+                    ("Expand all", Action::ExpandAll),
                 ] {
                     if ui.button(label).clicked() {
                         actions.push(action);
