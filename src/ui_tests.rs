@@ -115,7 +115,13 @@ fn worker_reports_io_errors_and_preserves_invalid_source() {
     })
     .unwrap();
     match receive.recv_timeout(Duration::from_secs(5)).unwrap().output {
-        Output::Opened(_, Kind::Json, Err(_), Some(content)) => assert_eq!(&*content, "{\"a\":"),
+        Output::Opened(Ok(set)) => {
+            assert_eq!(set.documents.len(), 1);
+            let document = &set.documents[0];
+            assert_eq!(document.kind, Kind::Json);
+            assert!(document.parsed.is_err());
+            assert_eq!(document.text.as_deref(), Some("{\"a\":"));
+        }
         _ => panic!("Invalid source must remain available for editing"),
     }
     send.send(Job {
@@ -127,7 +133,7 @@ fn worker_reports_io_errors_and_preserves_invalid_source() {
     .unwrap();
     assert!(matches!(
         receive.recv_timeout(Duration::from_secs(5)).unwrap().output,
-        Output::Opened(_, _, Err(_), None)
+        Output::Opened(Err(_))
     ));
     send.send(Job {
         tab: 1,
@@ -189,8 +195,13 @@ fn worker_opens_extreme_lines_without_changing_the_source() {
     })
     .unwrap();
     match receive.recv_timeout(Duration::from_secs(5)).unwrap().output {
-        Output::Opened(_, Kind::Json, Ok(document), Some(content)) => {
-            assert_eq!(&*content, text);
+        Output::Opened(Ok(set)) => {
+            assert_eq!(set.documents.len(), 1);
+            let document = &set.documents[0];
+            assert_eq!(document.kind, Kind::Json);
+            let content = document.text.as_deref().expect("source text");
+            assert_eq!(content, text);
+            let document = document.parsed.as_ref().expect("document parses");
             assert_eq!(
                 document
                     .nodes
@@ -571,4 +582,103 @@ fn startup_plan_keeps_last_working_backend_after_a_crash_fallback() {
         startup_plan(RendererChoice::WgpuDx12, None, Some("glow"), true),
         vec![StartupAttempt::WgpuDx12]
     );
+}
+
+fn write_zip(path: &Path, files: &[(&str, &[u8])]) {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let file = fs::File::create(path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    for (name, bytes) in files {
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file(*name, options).unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
+#[test]
+fn opening_a_zip_creates_a_tab_per_text_file() {
+    let directory = unique_path("xmljson-zip");
+    fs::create_dir(&directory).unwrap();
+    let path = directory.join("sample.zip");
+    write_zip(
+        &path,
+        &[
+            ("nested/a.xml", b"<root/>"),
+            ("b.json", br#"{"n":1}"#),
+            ("bad.bin", &[0, 255, 254]),
+        ],
+    );
+
+    let mut app = App::new(None);
+    app.open(path.clone());
+    wait(&mut app, |app| matches!(app.dialog, Some(Dialog::Zip(_))));
+    match &app.dialog {
+        Some(Dialog::Zip(prompt)) => {
+            assert_eq!(prompt.names, ["nested/a.xml", "b.json"]);
+            assert!(prompt.skipped > 0);
+        }
+        _ => panic!("zip should ask before opening"),
+    }
+    assert_eq!(app.tabs.len(), 1);
+    assert_eq!(app.tabs[0].editor.len_chars(), 0);
+    app.dialog = None;
+    assert_eq!(app.tabs.len(), 1);
+
+    app.open(path);
+    wait(&mut app, |app| matches!(app.dialog, Some(Dialog::Zip(_))));
+    if let Some(Dialog::Zip(prompt)) = &mut app.dialog {
+        prompt.selected[1] = true;
+    }
+    app.open_confirmed_zip(false);
+    wait(&mut app, |app| {
+        app.tabs.len() == 1 && app.tabs[0].editor.editable && app.tabs[0].tree_current()
+    });
+    assert_eq!(app.tabs[0].title(), "b.json");
+    assert!(app.tabs[0].path.is_none());
+
+    let mut app = App::new(None);
+    app.open(directory.join("sample.zip"));
+    wait(&mut app, |app| matches!(app.dialog, Some(Dialog::Zip(_))));
+    app.open_confirmed_zip(true);
+    wait(&mut app, |app| {
+        app.tabs.len() == 2
+            && app
+                .tabs
+                .iter()
+                .all(|tab| tab.editor.editable && tab.tree_current())
+    });
+    let titles: Vec<_> = app.tabs.iter().map(|tab| tab.title()).collect();
+    assert!(titles.iter().any(|title| title == "nested/a.xml"));
+    assert!(titles.iter().any(|title| title == "b.json"));
+    assert!(app.tabs.iter().all(|tab| tab.path.is_none() && !tab.dirty));
+    assert!(app.tabs.iter().any(|tab| tab.status.contains("Skipped")));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn decode_on_open_applies_to_files_inside_a_zip() {
+    let directory = unique_path("xmljson-zip-decode");
+    fs::create_dir(&directory).unwrap();
+    let path = directory.join("sample.zip");
+    let original = r#"{"auditData":{"data":"{\"request\":{\"id\":1}}"}}"#;
+    write_zip(&path, &[("wrapped.json", original.as_bytes())]);
+
+    let mut app = App::new(None);
+    app.decode_on_open = true;
+    app.open(path);
+    wait(&mut app, |app| matches!(app.dialog, Some(Dialog::Zip(_))));
+    app.open_confirmed_zip(true);
+    wait(&mut app, |app| {
+        app.tabs[0].editor.text().contains("\"id\": 1")
+    });
+    assert!(app.tabs[0].dirty);
+    assert!(app.tabs[0].path.is_none());
+    assert_eq!(app.tabs[0].title(), "wrapped.json");
+    assert!(app.tabs[0].editor.undo());
+    assert_eq!(app.tabs[0].editor.text(), original);
+    fs::remove_dir_all(directory).unwrap();
 }
