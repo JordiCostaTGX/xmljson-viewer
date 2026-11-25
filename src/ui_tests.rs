@@ -366,6 +366,25 @@ fn decode_without_selection_structures_xml_document() {
 }
 
 #[test]
+fn decode_on_open_structures_the_file_without_marking_it_dirty() {
+    let path = unique_path("xmljson-decode-on-open").with_extension("json");
+    let original = r#"{"auditData":{"data":"{\"request\":{\"id\":1}}"}}"#;
+    fs::write(&path, original).unwrap();
+    let mut app = App::new(None);
+    app.decode_on_open = true;
+    app.open(path.clone());
+    wait(&mut app, |app| {
+        app.tabs[0].editor.text().contains("\"id\": 1")
+    });
+    app.process_changes(Instant::now());
+    assert!(!app.tabs[0].dirty, "the file on disk is unchanged");
+    assert!(app.tabs[0].status.starts_with("Decoded on open"));
+    assert!(app.tabs[0].editor.undo());
+    assert_eq!(app.tabs[0].editor.text(), original);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn files_forwarded_from_another_instance_open_as_tabs() {
     let directory = unique_path("xmljson-single-instance");
     fs::create_dir(&directory).unwrap();

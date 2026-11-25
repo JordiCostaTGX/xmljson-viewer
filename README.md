@@ -118,6 +118,8 @@ SmartScreen warnings. Benchmark mode does not create startup logs or dialogs.
   and scrolls it into view. Clicking the node's text toggles expansion,
   as does its arrow. Clicking the empty space below the tree selects its
   last row. The tree also supports arrow keys and Enter.
+- **Expand all** / **Collapse all** (status bar) open every branch of the
+  tree, or close everything except the roots and their direct children.
 - Source ranges handle repeated keys, repeated XML names, array indices,
   numeric object keys, Unicode, CRLF line endings and a UTF-8 byte order
   mark.
@@ -128,7 +130,9 @@ SmartScreen warnings. Benchmark mode does not create startup logs or dialogs.
   and the choice is remembered. On Windows the title bar follows the theme.
 - Two-space formatting and explicit XML/JSON parsing.
 - Decode selected escaped content, including XML/JSON `auditData` wrappers,
-  HTML entities, and escaped JSON strings.
+  HTML entities, and escaped JSON strings. With **Options › Decode files on
+  open**, every opened file is decoded and structured automatically; the tab
+  is not marked as modified and `Ctrl+Z` restores the original text.
 - Right-click a JSON string and choose **Open as XML**, or right-click an XML
   text or CDATA node and choose **Open as JSON** for embedded objects and arrays.
   The decoded payload opens in a new tab without changing the source document.

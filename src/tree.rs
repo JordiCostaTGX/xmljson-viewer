@@ -103,6 +103,49 @@ impl Tree {
         self.rebuild();
     }
 
+    /// Expands every branch, including all blocks of large branches.
+    pub fn expand_all(&mut self) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        let parents = std::iter::once(None).chain((0..document.nodes.len()).map(Some));
+        for parent in parents {
+            let count = ids(&document, parent).len();
+            if let Some(id) = parent
+                && count > 0
+            {
+                self.expanded.insert(RowKey::Node(id));
+            }
+            if count > GROUP {
+                for index in 0..count.div_ceil(GROUP) {
+                    self.expanded.insert(RowKey::Group { parent, index });
+                }
+            }
+        }
+        self.after_bulk_toggle();
+    }
+
+    /// Collapses everything except the roots, so their direct children stay visible.
+    pub fn collapse_all(&mut self) {
+        let Some(document) = self.document.clone() else {
+            return;
+        };
+        self.expanded.clear();
+        self.expanded
+            .extend(document.roots.iter().map(|&root| RowKey::Node(root)));
+        self.after_bulk_toggle();
+    }
+
+    fn after_bulk_toggle(&mut self) {
+        self.rebuild();
+        // Keep the selection in view, or go to the top if it is now hidden.
+        self.scroll_to = Some(
+            self.selected
+                .and_then(|key| self.rows.iter().position(|row| row.key == key))
+                .unwrap_or(0),
+        );
+    }
+
     fn rebuild(&mut self) {
         self.rows.clear();
         let Some(document) = self.document.clone() else {
@@ -450,6 +493,23 @@ mod tests {
         let rows = tree.rows.len();
         tree.toggle(RowKey::Node(target));
         assert_eq!(tree.rows.len(), rows - 1);
+    }
+
+    #[test]
+    fn expand_all_opens_every_branch_and_block_and_collapse_all_keeps_the_first_level() {
+        let mut text = String::from("<r><a><b><c/></b></a><big>");
+        for id in 0..600 {
+            text.push_str(&format!("<e id=\"{id}\"/>"));
+        }
+        text.push_str("</big></r>");
+        let (mut tree, document) = tree(&text, Kind::Xml);
+        tree.expand_all();
+        let groups = 600usize.div_ceil(GROUP);
+        assert_eq!(tree.rows.len(), document.nodes.len() + groups);
+        tree.collapse_all();
+        let root = document.roots[0];
+        assert_eq!(tree.rows.len(), 1 + document.nodes[root].children.len());
+        assert!(tree.rows[1..].iter().all(|row| row.depth == 1));
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub struct Settings {
     pub open_files_in_new_window: bool,
     pub search_case_sensitive: bool,
     pub theme: String,
+    pub decode_on_open: bool,
 }
 
 impl Default for Settings {
@@ -22,6 +23,7 @@ impl Default for Settings {
             open_files_in_new_window: false,
             search_case_sensitive: true,
             theme: "dark".into(),
+            decode_on_open: false,
         }
     }
 }
