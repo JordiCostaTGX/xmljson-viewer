@@ -12,6 +12,7 @@ pub struct Settings {
     pub tree_width: f32,
     pub open_files_in_new_window: bool,
     pub search_case_sensitive: bool,
+    pub theme: String,
 }
 
 impl Default for Settings {
@@ -20,6 +21,7 @@ impl Default for Settings {
             tree_width: DEFAULT_TREE_WIDTH,
             open_files_in_new_window: false,
             search_case_sensitive: true,
+            theme: "dark".into(),
         }
     }
 }

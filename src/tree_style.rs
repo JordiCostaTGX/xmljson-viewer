@@ -1,39 +1,35 @@
-use crate::document::{LabelStyle, ValueStyle};
+use crate::{
+    document::{LabelStyle, ValueStyle},
+    theme::Palette,
+};
 use eframe::egui::{
     Color32, FontId,
     text::{LayoutJob, LayoutSection, TextFormat},
 };
 use std::ops::Range;
 
-pub const BACKGROUND: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x1e);
-pub const HOVER: Color32 = Color32::from_rgb(0x29, 0x2d, 0x36);
-pub const SELECTED: Color32 = Color32::from_rgb(0x25, 0x32, 0x47);
-pub const EXPANDER: Color32 = KEY;
-const KEY: Color32 = Color32::from_rgb(0x9c, 0xdc, 0xfe);
-const STRING: Color32 = Color32::from_rgb(0xce, 0x91, 0x78);
-const NUMBER: Color32 = Color32::from_rgb(0xb5, 0xce, 0xa8);
-const LITERAL: Color32 = Color32::from_rgb(0x82, 0xb8, 0xef);
-const ATTRIBUTE: Color32 = Color32::from_rgb(0xc5, 0xa5, 0xef);
-const MUTED: Color32 = Color32::from_rgb(0xab, 0xb2, 0xbf);
-
 /// Colors per byte range; later ranges override earlier ones.
-fn colors(text: &str, style: Option<&LabelStyle>) -> Vec<(Range<usize>, Color32)> {
+fn colors(
+    text: &str,
+    style: Option<&LabelStyle>,
+    palette: &Palette,
+) -> Vec<(Range<usize>, Color32)> {
     let end = text.len();
-    let mut colors = vec![(0..end, MUTED)];
+    let mut colors = vec![(0..end, palette.tree_muted)];
     match style {
         Some(LabelStyle::Json { key_end, value }) => {
             let start = match key_end {
                 Some(key_end) => {
-                    colors.push((0..*key_end as usize, KEY));
+                    colors.push((0..*key_end as usize, palette.key));
                     *key_end as usize + 2
                 }
                 None => 0,
             };
             let color = match value {
-                ValueStyle::Container => MUTED,
-                ValueStyle::String => STRING,
-                ValueStyle::Number => NUMBER,
-                ValueStyle::Literal => LITERAL,
+                ValueStyle::Container => palette.tree_muted,
+                ValueStyle::String => palette.string,
+                ValueStyle::Number => palette.number,
+                ValueStyle::Literal => palette.tree_literal,
             };
             colors.push((start.min(end)..end, color));
         }
@@ -41,27 +37,27 @@ fn colors(text: &str, style: Option<&LabelStyle>) -> Vec<(Range<usize>, Color32)
             element_end,
             attributes,
         }) => {
-            colors.push((1..*element_end as usize, KEY));
+            colors.push((1..*element_end as usize, palette.key));
             for attribute in attributes.iter() {
                 colors.push((
                     attribute.name.start as usize..attribute.name.end as usize,
-                    ATTRIBUTE,
+                    palette.tree_attribute,
                 ));
                 colors.push((
                     attribute.value.start as usize..attribute.value.end as usize,
-                    STRING,
+                    palette.string,
                 ));
             }
         }
-        Some(LabelStyle::Text) => colors.push((0..end, STRING)),
+        Some(LabelStyle::Text) => colors.push((0..end, palette.string)),
         Some(LabelStyle::Plain) | None => {}
     }
     colors
 }
 
-pub fn job(text: &str, style: Option<&LabelStyle>, font: FontId) -> LayoutJob {
-    let mut per_byte = vec![MUTED; text.len()];
-    for (range, color) in colors(text, style) {
+pub fn job(text: &str, style: Option<&LabelStyle>, font: FontId, palette: &Palette) -> LayoutJob {
+    let mut per_byte = vec![palette.tree_muted; text.len()];
+    for (range, color) in colors(text, style, palette) {
         per_byte[range].fill(color);
     }
     let mut job = LayoutJob {
@@ -86,6 +82,7 @@ pub fn job(text: &str, style: Option<&LabelStyle>, font: FontId) -> LayoutJob {
 mod tests {
     use super::*;
     use crate::document::{self, Kind};
+    use crate::theme::DARK;
     use std::sync::Arc;
 
     fn sections(job: &LayoutJob) -> Vec<(Range<usize>, Color32)> {
@@ -132,10 +129,11 @@ mod tests {
             label,
             Some(&doc.nodes[1].label_style),
             FontId::monospace(13.0),
+            &DARK,
         );
         assert_eq!(job.text, *label);
-        assert_eq!(sections(&job)[0], (0.."é:😀".len(), KEY));
-        assert_eq!(sections(&job).last().unwrap().1, STRING);
+        assert_eq!(sections(&job)[0], (0.."é:😀".len(), DARK.key));
+        assert_eq!(sections(&job).last().unwrap().1, DARK.string);
     }
 
     #[test]
@@ -167,6 +165,7 @@ mod tests {
             &node.label,
             Some(&node.label_style),
             FontId::monospace(13.0),
+            &DARK,
         );
         let total: usize = sections(&job).iter().map(|s| s.0.len()).sum();
         assert_eq!(total, node.label.len());
@@ -190,32 +189,17 @@ mod tests {
             &doc.nodes[1].label,
             Some(&doc.nodes[1].label_style),
             FontId::monospace(13.0),
+            &DARK,
         );
-        assert_eq!(sections(&styled), [(0..2, MUTED), (2..6, LITERAL)]);
         assert_eq!(
-            job("Items 1–512", None, FontId::monospace(13.0))
+            sections(&styled),
+            [(0..2, DARK.tree_muted), (2..6, DARK.tree_literal)]
+        );
+        assert_eq!(
+            job("Items 1–512", None, FontId::monospace(13.0), &DARK)
                 .sections
                 .len(),
             1
         );
-    }
-
-    #[test]
-    fn palette_contrast_remains_readable_on_selected_rows() {
-        fn luminance(color: Color32) -> f64 {
-            fn linear(value: u8) -> f64 {
-                let value = f64::from(value) / 255.0;
-                if value <= 0.04045 {
-                    value / 12.92
-                } else {
-                    ((value + 0.055) / 1.055).powf(2.4)
-                }
-            }
-            0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
-        }
-        let selected = luminance(SELECTED);
-        for color in [KEY, STRING, NUMBER, LITERAL, ATTRIBUTE, MUTED] {
-            assert!((luminance(color) + 0.05) / (selected + 0.05) >= 4.5);
-        }
     }
 }

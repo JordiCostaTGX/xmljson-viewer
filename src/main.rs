@@ -6,6 +6,7 @@ mod editor;
 mod settings;
 mod single_instance;
 mod syntax;
+mod theme;
 mod tree;
 mod tree_style;
 mod ui;

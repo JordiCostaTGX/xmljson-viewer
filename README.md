@@ -122,7 +122,10 @@ SmartScreen warnings. Benchmark mode does not create startup logs or dialogs.
   numeric object keys, Unicode, CRLF line endings and a UTF-8 byte order
   mark.
 - Tree labels distinguish keys, strings, numbers, literals, and XML
-  attributes with a dark high-contrast palette.
+  attributes with a high-contrast palette.
+- **Options › Theme**: Dark (default), Light, Dracula, Monokai, Nord and
+  Solarized Light. Colors are adjusted to keep WCAG contrast for code text,
+  and the choice is remembered. On Windows the title bar follows the theme.
 - Two-space formatting and explicit XML/JSON parsing.
 - Decode selected escaped content, including XML/JSON `auditData` wrappers,
   HTML entities, and escaped JSON strings.
