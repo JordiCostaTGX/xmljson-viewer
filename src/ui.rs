@@ -2,7 +2,7 @@ use crate::{
     document::{self, Document, Kind},
     editor::Editor,
     settings::{self, Settings},
-    theme::{Palette, Theme},
+    theme::Theme,
     tree::Tree,
 };
 use eframe::egui::{self, Align, Id, Key, KeyboardShortcut, Layout, Modifiers, ViewportCommand};
@@ -31,7 +31,10 @@ const REPLACE_ID: &str = "replace-input";
 const TREE_MIN_WIDTH: f32 = 160.0;
 
 #[cfg(target_os = "windows")]
-fn set_native_titlebar(window: &impl raw_window_handle::HasWindowHandle, palette: &Palette) {
+fn set_native_titlebar(
+    window: &impl raw_window_handle::HasWindowHandle,
+    palette: &crate::theme::Palette,
+) {
     use raw_window_handle::RawWindowHandle;
     use windows_sys::Win32::Graphics::Dwm::{
         DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
