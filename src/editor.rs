@@ -3,8 +3,9 @@ use crate::{
     syntax::{self, State, Style},
 };
 use eframe::egui::{
-    self, Align, Align2, Color32, Context, CursorIcon, Event, EventFilter, FontId, Galley, Id,
-    ImeEvent, Key, Modifiers, Rect, ScrollArea, Sense, Ui, pos2,
+    self, Align, Align2, Button, Color32, Context, CursorIcon, Event, EventFilter, FontId, Galley,
+    Id, ImeEvent, Key, KeyboardShortcut, Modifiers, Rect, ScrollArea, Sense, Ui, ViewportCommand,
+    pos2,
     text::{CCursor, LayoutJob, TextFormat},
     vec2,
 };
@@ -54,6 +55,17 @@ struct Group {
 struct Scroll {
     position: usize,
     center: bool,
+}
+
+#[derive(Clone, Copy)]
+enum MenuAction {
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    Delete,
+    SelectAll,
 }
 
 #[derive(Clone)]
@@ -162,9 +174,12 @@ impl Editor {
         (line, self.cursor - self.rope.line_to_char(line))
     }
 
-    #[cfg(test)]
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
     }
 
     pub fn set_kind(&mut self, kind: Kind) {
@@ -790,8 +805,15 @@ impl Editor {
                 let pointer = ctx.input(|input| input.pointer.interact_pos());
                 if let Some(pos) = pointer {
                     let pressed = ctx.input(|input| input.pointer.primary_pressed());
+                    let secondary =
+                        response.hovered() && ctx.input(|input| input.pointer.secondary_pressed());
                     let (double, triple) = (response.double_clicked(), response.triple_clicked());
-                    if (pressed && response.hovered()) || response.dragged() || double || triple {
+                    if (pressed && response.hovered())
+                        || secondary
+                        || response.dragged()
+                        || double
+                        || triple
+                    {
                         let line = (((pos.y - origin.y) / row_height).floor().max(0.0) as usize)
                             .min(lines - 1);
                         let layout = self.line_layout(&ctx, line, column, &font);
@@ -810,6 +832,14 @@ impl Editor {
                             self.cursor = hit;
                             if !shift {
                                 self.anchor = hit;
+                            }
+                        } else if secondary {
+                            ctx.memory_mut(|memory| memory.request_focus(id));
+                            // Like native editors, right-clicking inside the selection keeps it.
+                            let selection = self.selection();
+                            if !(selection.start..=selection.end).contains(&hit) {
+                                self.anchor = hit;
+                                self.cursor = hit;
                             }
                         } else {
                             self.cursor = hit;
@@ -933,7 +963,99 @@ impl Editor {
                         },
                     );
                 }
+
+                self.context_menu(&response, id);
             });
+    }
+
+    fn context_menu(&mut self, response: &egui::Response, id: Id) {
+        let ctx = response.ctx.clone();
+        let selection = self.selection();
+        let selected = !selection.is_empty();
+        let editable = self.editable;
+        let (can_undo, can_redo) = (self.can_undo(), self.can_redo());
+        let mut chosen = None;
+        response.context_menu(|ui| {
+            let mut item = |ui: &mut Ui,
+                            label: &str,
+                            modifiers: Modifiers,
+                            key: Key,
+                            enabled: bool,
+                            action: MenuAction| {
+                let shortcut = ctx.format_shortcut(&KeyboardShortcut::new(modifiers, key));
+                let button = Button::new(label).shortcut_text(shortcut);
+                if ui.add_enabled(enabled, button).clicked() {
+                    chosen = Some(action);
+                    ui.close();
+                }
+            };
+            let command = Modifiers::COMMAND;
+            item(
+                ui,
+                "Undo",
+                command,
+                Key::Z,
+                editable && can_undo,
+                MenuAction::Undo,
+            );
+            item(
+                ui,
+                "Redo",
+                command,
+                Key::Y,
+                editable && can_redo,
+                MenuAction::Redo,
+            );
+            ui.separator();
+            item(
+                ui,
+                "Cut",
+                command,
+                Key::X,
+                editable && selected,
+                MenuAction::Cut,
+            );
+            item(ui, "Copy", command, Key::C, selected, MenuAction::Copy);
+            item(ui, "Paste", command, Key::V, editable, MenuAction::Paste);
+            item(
+                ui,
+                "Delete",
+                Modifiers::NONE,
+                Key::Delete,
+                editable && selected,
+                MenuAction::Delete,
+            );
+            ui.separator();
+            item(
+                ui,
+                "Select all",
+                command,
+                Key::A,
+                self.len_chars() > 0,
+                MenuAction::SelectAll,
+            );
+        });
+        let Some(action) = chosen else {
+            return;
+        };
+        // Clicking the menu surrendered focus; the editor needs it back to receive the paste.
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        match action {
+            MenuAction::Undo => {
+                self.undo();
+            }
+            MenuAction::Redo => {
+                self.redo();
+            }
+            MenuAction::Cut => {
+                ctx.copy_text(self.selected_text());
+                self.delete(selection);
+            }
+            MenuAction::Copy => ctx.copy_text(self.selected_text()),
+            MenuAction::Paste => ctx.send_viewport_cmd(ViewportCommand::RequestPaste),
+            MenuAction::Delete => self.delete(selection),
+            MenuAction::SelectAll => self.select_all(),
+        }
     }
 }
 
@@ -1008,5 +1130,42 @@ mod tests {
         editor.replace(0..4, "<a>");
         assert_eq!(editor.state_at(1), State::Text);
         assert_eq!(editor.state_at(3), State::Text);
+    }
+
+    #[test]
+    fn right_click_keeps_selection_inside_it_and_moves_caret_outside() {
+        let ctx = Context::default();
+        let mut editor = editor("hello world\nsecond line");
+        let id = Id::unique("editor");
+        let frame = |editor: &mut Editor, events: Vec<Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| editor.ui(ui, id, false))
+                .textures_delta
+                .clear();
+        };
+        let right_click = |pos| {
+            vec![
+                Event::PointerMoved(pos),
+                Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    modifiers: Modifiers::NONE,
+                },
+            ]
+        };
+        frame(&mut editor, vec![]);
+        editor.select_range(0, 11);
+        frame(&mut editor, vec![]);
+        // Well inside the first line, which is fully selected.
+        frame(&mut editor, right_click(pos2(100.0, 5.0)));
+        assert_eq!(editor.selection(), 0..11);
+        // Second line, far right: the caret moves to its end.
+        frame(&mut editor, right_click(pos2(700.0, 25.0)));
+        assert_eq!(editor.selection(), 23..23);
     }
 }
