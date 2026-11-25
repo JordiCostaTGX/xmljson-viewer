@@ -7,8 +7,42 @@ use std::{
 };
 
 static LOG: OnceLock<StartupLog> = OnceLock::new();
+static LOGGER: DiagnosticsLogger = DiagnosticsLogger;
+
+struct DiagnosticsLogger;
+
+impl log::Log for DiagnosticsLogger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        match metadata.level() {
+            log::Level::Error | log::Level::Warn => true,
+            log::Level::Info => {
+                let target = metadata.target();
+                target.starts_with("eframe")
+                    || target.starts_with("egui_wgpu")
+                    || target.starts_with("egui_glow")
+                    || target.starts_with("wgpu")
+                    || target.starts_with("winit")
+            }
+            _ => false,
+        }
+    }
+
+    fn log(&self, record_entry: &log::Record<'_>) {
+        if self.enabled(record_entry.metadata()) {
+            record(&format!(
+                "[{} {}] {}",
+                record_entry.level(),
+                record_entry.target(),
+                record_entry.args()
+            ));
+        }
+    }
+
+    fn flush(&self) {}
+}
 
 struct StartupLog {
+    directory: PathBuf,
     path: PathBuf,
     file: Mutex<File>,
 }
@@ -20,19 +54,85 @@ impl StartupLog {
         drop(File::create(&path)?);
         let file = OpenOptions::new().append(true).open(&path)?;
         Ok(Self {
+            directory: directory.to_path_buf(),
             path,
             file: Mutex::new(file),
         })
     }
 
+    fn pending_marker_path(&self) -> PathBuf {
+        self.directory.join("graphics-init.pending")
+    }
+
+    fn remembered_renderer_path(&self) -> PathBuf {
+        self.directory.join("graphics-renderer")
+    }
+
     fn write(&self, message: &str) {
         if let Ok(mut file) = self.file.lock() {
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default();
-            let _ = writeln!(file, "[{}] {message}", timestamp.as_secs_f64());
-            let _ = file.flush();
+            write_line(&mut file, message);
         }
+    }
+
+    // A crashing thread may already hold the lock; blocking would hang instead of exiting.
+    fn try_write(&self, message: &str) {
+        if let Ok(mut file) = self.file.try_lock() {
+            write_line(&mut file, message);
+        }
+    }
+}
+
+fn write_line(file: &mut File, message: &str) {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let _ = writeln!(file, "[{}] {message}", timestamp.as_secs_f64());
+    let _ = file.flush();
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn unhandled_exception_filter(
+    info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    use windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH;
+
+    if !info.is_null() {
+        let record_ptr = unsafe { (*info).ExceptionRecord };
+        if !record_ptr.is_null() {
+            let code = unsafe { (*record_ptr).ExceptionCode as u32 };
+            let address = unsafe { (*record_ptr).ExceptionAddress as usize };
+            let label = match code {
+                0xC000_0005 => "STATUS_ACCESS_VIOLATION",
+                0xC000_001D => "STATUS_ILLEGAL_INSTRUCTION",
+                0xC000_00FD => "STATUS_STACK_OVERFLOW",
+                0xC000_0409 => "STATUS_STACK_BUFFER_OVERRUN",
+                0x8000_0003 => "STATUS_BREAKPOINT",
+                _ => "UNKNOWN_EXCEPTION",
+            };
+            record_without_blocking(&format!(
+                "FATAL: Unhandled Windows exception 0x{code:08X} ({label}) at 0x{address:016X}"
+            ));
+        } else {
+            record_without_blocking("FATAL: Unhandled Windows exception (no exception record)");
+        }
+    } else {
+        record_without_blocking("FATAL: Unhandled Windows exception (null pointers)");
+    }
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+#[cfg(target_os = "windows")]
+fn record_without_blocking(message: &str) {
+    if let Some(log) = LOG.get() {
+        log.try_write(message);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn install_native_crash_handler() {
+    use windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter;
+    unsafe {
+        SetUnhandledExceptionFilter(Some(unhandled_exception_filter));
     }
 }
 
@@ -48,6 +148,11 @@ pub fn initialize() {
         }
         Err(error) => eprintln!("Could not create startup log: {error}"),
     }
+    if log::set_logger(&LOGGER).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
+    #[cfg(target_os = "windows")]
+    install_native_crash_handler();
     std::panic::set_hook(Box::new(|info| {
         let message = format!("Unexpected panic: {info}");
         record(&format!(
@@ -63,6 +168,37 @@ pub fn initialize() {
         std::env::consts::ARCH,
         std::process::id()
     ));
+}
+
+pub fn previous_graphics_init_failure() -> Option<String> {
+    let path = LOG.get()?.pending_marker_path();
+    let content = fs::read_to_string(path).ok()?;
+    let trimmed = content.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+pub fn mark_graphics_init_started(attempt: &str) {
+    if let Some(log) = LOG.get() {
+        let _ = fs::write(log.pending_marker_path(), attempt);
+    }
+}
+
+pub fn mark_graphics_init_succeeded() {
+    if let Some(log) = LOG.get() {
+        let _ = fs::remove_file(log.pending_marker_path());
+    }
+}
+
+pub fn remembered_renderer() -> Option<String> {
+    let content = fs::read_to_string(LOG.get()?.remembered_renderer_path()).ok()?;
+    let trimmed = content.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+pub fn remember_renderer(attempt: &str) {
+    if let Some(log) = LOG.get() {
+        let _ = fs::write(log.remembered_renderer_path(), attempt);
+    }
 }
 
 pub fn record(message: &str) {
