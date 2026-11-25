@@ -1,6 +1,6 @@
 [package]
 name = "xmljson-viewer"
-version = "1.1.4"
+version = "1.2.0"
 edition = "2024"
 description = "Cross-platform XML/JSON editor with a lazy tree"
 include = [
@@ -16,7 +16,7 @@ log = "0.4"
 rfd = "0.18"
 ropey = { version = "1.6", default-features = false, features = ["simd", "cr_lines"] }
 quick-xml = "0.37"
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 html-escape = "0.2"
 regex = "1"

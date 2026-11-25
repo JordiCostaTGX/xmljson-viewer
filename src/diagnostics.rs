@@ -8,6 +8,7 @@ use std::{
 
 static LOG: OnceLock<StartupLog> = OnceLock::new();
 static LOGGER: DiagnosticsLogger = DiagnosticsLogger;
+const MAX_LOG_BYTES: u64 = 1024 * 1024;
 
 struct DiagnosticsLogger;
 
@@ -51,8 +52,11 @@ impl StartupLog {
     fn create(directory: &Path) -> io::Result<Self> {
         fs::create_dir_all(directory)?;
         let path = directory.join("startup.log");
-        drop(File::create(&path)?);
-        let file = OpenOptions::new().append(true).open(&path)?;
+        // Several windows share the log, so it is only rotated when it grows large.
+        if fs::metadata(&path).is_ok_and(|metadata| metadata.len() > MAX_LOG_BYTES) {
+            let _ = fs::rename(&path, directory.join("startup.old.log"));
+        }
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
             directory: directory.to_path_buf(),
             path,
@@ -87,7 +91,12 @@ fn write_line(file: &mut File, message: &str) {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let _ = writeln!(file, "[{}] {message}", timestamp.as_secs_f64());
+    let _ = writeln!(
+        file,
+        "[{}] [pid {}] {message}",
+        timestamp.as_secs_f64(),
+        std::process::id()
+    );
     let _ = file.flush();
 }
 
@@ -253,7 +262,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn startup_log_flushes_entries_and_overwrites_previous_launch() {
+    fn startup_log_keeps_entries_from_every_process_and_rotates_when_large() {
         let directory = std::env::temp_dir().join(format!(
             "xmljson-viewer-diagnostics-test-{}",
             std::process::id()
@@ -263,21 +272,32 @@ mod tests {
         first.write("ERROR: Could not start listener");
         let text = fs::read_to_string(&first.path).unwrap();
         assert!(text.contains("Starting viewer"));
-        assert!(text.contains("ERROR: Could not start listener"));
+        assert!(text.contains(&format!("[pid {}]", std::process::id())));
         let second = StartupLog::create(&directory).unwrap();
         assert_eq!(first.path, second.path);
         assert_eq!(second.path.file_name().unwrap(), "startup.log");
-        assert!(fs::read_to_string(&second.path).unwrap().is_empty());
         second.write("New launch");
         first.write("Existing instance still running");
         let text = fs::read_to_string(&second.path).unwrap();
+        assert!(text.contains("Could not start listener"));
         assert!(text.contains("New launch"));
         assert!(text.contains("Existing instance still running"));
-        assert!(!text.contains("Could not start listener"));
         assert!(!text.contains('\0'));
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
         drop(first);
         drop(second);
+        fs::write(
+            directory.join("startup.log"),
+            vec![b'x'; MAX_LOG_BYTES as usize + 1],
+        )
+        .unwrap();
+        let rotated = StartupLog::create(&directory).unwrap();
+        rotated.write("After rotation");
+        let text = fs::read_to_string(&rotated.path).unwrap();
+        assert!(text.contains("After rotation"));
+        assert!(!text.contains("xxx"));
+        assert!(directory.join("startup.old.log").exists());
+        drop(rotated);
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -48,8 +48,11 @@ Release builds on Windows do not open a console window.
 
 ## Startup diagnostics
 
-Each GUI launch overwrites the single `startup.log` file in
-`%LOCALAPPDATA%\xmljson-viewer\logs` on Windows. If that directory is
+Every process appends to the shared `startup.log` file in
+`%LOCALAPPDATA%\xmljson-viewer\logs` on Windows; each line carries the
+process ID, so entries from several windows can be told apart. When the log
+grows beyond 1 MiB it is renamed to `startup.old.log` on the next launch.
+If that directory is
 unavailable, the application uses `xmljson-viewer/logs` inside the system
 temporary directory (also the default on Linux and macOS).
 
@@ -60,9 +63,8 @@ exceptions. Startup errors and Rust panics automatically open the log
 in Notepad on Windows (the default file viewer on Linux and macOS) and
 display an error dialog with the error and log path. If opening the log
 fails, the dialog reports that too. Panic logs also include a backtrace.
-When reporting a launch failure, attach `startup.log` and the dialog text
-before launching the application again, since the next launch clears the
-log. Older `startup-*.log` files from previous versions can be deleted
+When reporting a launch failure, attach `startup.log` and the dialog text.
+Older `startup-*.log` files from previous versions can be deleted
 manually.
 
 ### Graphics backend compatibility (Windows & older PCs)
@@ -105,13 +107,17 @@ SmartScreen warnings. Benchmark mode does not create startup logs or dialogs.
 ## Features
 
 - Independent tabs, undo/redo, line numbers, syntax colors (JSON and XML),
-  cursor position, and a resizable tree panel.
+  cursor position, and a resizable tree panel whose width is remembered.
+- Several windows: **File › New window**, or right-click a saved tab and
+  choose **Move to new window**, to compare documents side by side
+  (for example with Win+← / Win+→).
 - Open multiple files through the menu, command-line arguments, or
   drag-and-drop.
 - Click a tree item to select its source text. `Ctrl+E` selects the element
   at the cursor and reveals its tree path. `Ctrl+L` also expands that node
   and scrolls it into view. Clicking the node's text toggles expansion,
-  as does its arrow. The tree also supports arrow keys and Enter.
+  as does its arrow. Clicking the empty space below the tree selects its
+  last row. The tree also supports arrow keys and Enter.
 - Source ranges handle repeated keys, repeated XML names, array indices,
   numeric object keys, Unicode, CRLF line endings and a UTF-8 byte order
   mark.
@@ -123,8 +129,12 @@ SmartScreen warnings. Benchmark mode does not create startup logs or dialogs.
 - Right-click a JSON string and choose **Open as XML**, or right-click an XML
   text or CDATA node and choose **Open as JSON** for embedded objects and arrays.
   The decoded payload opens in a new tab without changing the source document.
-- Literal case-sensitive search, highlighted matches, a match count, and
-  next/previous navigation with wraparound.
+- Literal search, highlighted matches, a match count, and next/previous
+  navigation with wraparound. Search is case-sensitive by default; turn off
+  **Options › Case-sensitive search** to ignore case.
+- Replace (`Ctrl+H` or **Edit › Replace**): **Replace** selects the next
+  match and replaces it on the next press; **Replace all** changes every
+  match as a single undoable edit.
 - Save/Save as, dirty indicators, and confirmation before discarding edits.
   Saving writes a temporary file next to the target and renames it over
   the original in the background. Edits made after a save starts remain
@@ -133,12 +143,14 @@ SmartScreen warnings. Benchmark mode does not create startup logs or dialogs.
 | Shortcut                          | Action                                       |
 | --------------------------------- | -------------------------------------------- |
 | Ctrl+T / Ctrl+W                   | New tab / close tab                          |
+| Ctrl+Shift+N                      | New window                                   |
 | Ctrl+O                            | Open                                         |
 | Ctrl+S / Ctrl+Shift+S             | Save / Save as                               |
 | Ctrl+I                            | Format document                              |
 | Ctrl+E                            | Select element and reveal its tree path      |
 | Ctrl+L                            | Locate, select, and expand the cursor's node |
 | Ctrl+F / Escape                   | Show / close search                          |
+| Ctrl+H (Cmd+Option+F on macOS)    | Show replace                                 |
 | Enter in search, F3 / Shift+F3    | Next / previous match                        |
 | Ctrl+A / Ctrl+C / Ctrl+X / Ctrl+V | Select all / copy / cut / paste              |
 | Ctrl+Z / Ctrl+Shift+Z (or Ctrl+Y) | Undo / redo                                  |
@@ -178,8 +190,14 @@ than introducing whitespace that changes their values. Decode handles
 common escaping layers without Python's `unicode_escape` transformation,
 which can corrupt Unicode.
 
-Each launch opens its own window; files are not forwarded to an already
-running instance.
+Files opened from the file explorer or the command line go to a new tab in
+the first window that was opened. Enable **Options › Open files in new
+windows** to give each of them its own window instead, or pass
+`--new-window` on the command line. If that first window is closed while
+others remain, the next file opens in a new window. Settings are stored in
+`settings.json` under `%LOCALAPPDATA%\xmljson-viewer` on Windows,
+`~/Library/Application Support/xmljson-viewer` on macOS, and
+`$XDG_CONFIG_HOME/xmljson-viewer` (or `~/.config/xmljson-viewer`) on Linux.
 
 ## Linux installation
 

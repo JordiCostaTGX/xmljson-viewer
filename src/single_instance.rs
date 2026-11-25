@@ -13,10 +13,20 @@ const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const ACK: &[u8; 2] = b"OK";
 const REJECTED: &[u8; 2] = b"NO";
 
+pub enum Launch {
+    /// The running window received the files; this process should exit.
+    Forwarded,
+    /// This window receives later open requests.
+    Primary,
+    /// Another window owns the listener; this one only shows its own files.
+    Independent,
+}
+
 pub fn forward_or_start(
     files: Vec<PathBuf>,
     incoming: mpsc::Sender<Vec<PathBuf>>,
-) -> Result<bool, String> {
+    new_window: bool,
+) -> Result<Launch, String> {
     let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port());
     match TcpListener::bind(address) {
         Ok(listener) => {
@@ -24,7 +34,10 @@ pub fn forward_or_start(
                 .name("single-instance-ipc".into())
                 .spawn(move || serve(listener, incoming))
                 .map_err(|error| error.to_string())?;
-            Ok(false)
+            Ok(Launch::Primary)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AddrInUse && new_window => {
+            Ok(Launch::Independent)
         }
         Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
             let mut stream = TcpStream::connect_timeout(&address.into(), Duration::from_secs(2))
@@ -40,7 +53,7 @@ pub fn forward_or_start(
             if &response != ACK {
                 return Err("The existing viewer rejected the open request".into());
             }
-            Ok(true)
+            Ok(Launch::Forwarded)
         }
         Err(error) => Err(format!(
             "Could not start the single-instance listener: {error}"

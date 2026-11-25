@@ -412,6 +412,22 @@ fn dirty_tabs_ask_before_closing_and_clean_tabs_close_directly() {
 }
 
 #[test]
+fn replace_respects_case_option_and_marks_the_tab_dirty() {
+    let mut app = App::new(None);
+    load(&mut app, 0, r#"{"Name":"a","name":"b"}"#, Kind::Json);
+    app.search_query = "NAME".into();
+    app.replace_text = "id".into();
+    app.replace(true);
+    assert_eq!(app.tabs[0].status, "No matches found");
+    app.search_case_sensitive = false;
+    app.replace(true);
+    assert_eq!(app.tabs[0].editor.text(), r#"{"id":"a","id":"b"}"#);
+    assert_eq!(app.tabs[0].status, "Replaced 2 occurrence(s)");
+    app.process_changes(Instant::now());
+    assert!(app.tabs[0].dirty);
+}
+
+#[test]
 fn renders_frames_headless() {
     let ctx = egui::Context::default();
     let mut app = App::new(Some(ctx.clone()));
@@ -440,6 +456,22 @@ fn renders_frames_headless() {
     frame(&mut app);
     assert_eq!(app.title, "XML/JSON Viewer — Untitled");
     assert!(app.tabs[0].editor.match_count() > 1100);
+
+    let search_rect = || ctx.read_response(Id::unique(SEARCH_ID)).unwrap().rect;
+    let before = search_rect();
+    app.replace_visible = true;
+    for _ in 0..3 {
+        frame(&mut app);
+    }
+    let replace = ctx.read_response(Id::unique(REPLACE_ID)).unwrap().rect;
+    let after = search_rect();
+    frame(&mut app);
+    assert_eq!(search_rect(), after, "the panel size is stable");
+    assert!(
+        after.top() < before.top() - replace.height() / 2.0,
+        "the search panel grows to fit the replace row"
+    );
+    assert!(replace.top() >= after.bottom());
 }
 
 #[test]
