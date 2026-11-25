@@ -3,6 +3,7 @@
 mod diagnostics;
 mod document;
 mod editor;
+mod settings;
 mod single_instance;
 mod syntax;
 mod tree;
@@ -10,14 +11,24 @@ mod tree_style;
 mod ui;
 
 use document::Kind;
+use single_instance::Launch;
 use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Instant};
 use ui::RendererChoice;
 
-fn parse_launch_args(args: Vec<OsString>) -> (RendererChoice, Vec<PathBuf>) {
+const NEW_WINDOW_FLAG: &str = "--new-window";
+
+struct LaunchArgs {
+    renderer: RendererChoice,
+    new_window: bool,
+    files: Vec<PathBuf>,
+}
+
+fn parse_launch_args(args: Vec<OsString>) -> LaunchArgs {
     let mut choice = std::env::var("XMLJSON_RENDERER")
         .ok()
         .and_then(|value| RendererChoice::parse(&value))
         .unwrap_or(RendererChoice::Auto);
+    let mut new_window = false;
     let mut files = Vec::new();
     let mut literal_only = false;
     let mut iter = args.into_iter();
@@ -44,6 +55,10 @@ fn parse_launch_args(args: Vec<OsString>) -> (RendererChoice, Vec<PathBuf>) {
                 continue;
             }
             match text {
+                NEW_WINDOW_FLAG => {
+                    new_window = true;
+                    continue;
+                }
                 "--gl" | "--glow" => {
                     choice = RendererChoice::Glow;
                     continue;
@@ -65,7 +80,11 @@ fn parse_launch_args(args: Vec<OsString>) -> (RendererChoice, Vec<PathBuf>) {
         }
         files.push(PathBuf::from(arg));
     }
-    (choice, files)
+    LaunchArgs {
+        renderer: choice,
+        new_window,
+        files,
+    }
 }
 
 fn main() {
@@ -82,19 +101,27 @@ fn main() {
         return;
     }
     diagnostics::initialize();
-    let (renderer_choice, files) = parse_launch_args(args);
+    let LaunchArgs {
+        renderer: renderer_choice,
+        new_window,
+        files,
+    } = parse_launch_args(args);
+    let new_window = new_window || (!files.is_empty() && settings::load().open_files_in_new_window);
     diagnostics::record(&format!(
-        "Open requests: {} file(s); renderer preference: {renderer_choice:?}",
+        "Open requests: {} file(s); renderer preference: {renderer_choice:?}; new window: {new_window}",
         files.len()
     ));
     let (incoming, requests) = std::sync::mpsc::channel();
     diagnostics::record("Initializing single-instance listener or forwarding request");
-    match single_instance::forward_or_start(files.clone(), incoming) {
-        Ok(true) => {
+    match single_instance::forward_or_start(files.clone(), incoming, new_window) {
+        Ok(Launch::Forwarded) => {
             diagnostics::record("Request forwarded to existing instance; exiting");
             return;
         }
-        Ok(false) => diagnostics::record("Single-instance listener ready"),
+        Ok(Launch::Primary) => diagnostics::record("Single-instance listener ready"),
+        Ok(Launch::Independent) => {
+            diagnostics::record("Another window owns the listener; starting an independent window")
+        }
         Err(error) => {
             diagnostics::report_error(&format!("Single-instance initialization failed: {error}"));
             std::process::exit(1);
@@ -162,23 +189,26 @@ mod tests {
 
     #[test]
     fn parse_launch_args_extracts_renderer_flags_and_keeps_files() {
-        let (choice, files) = parse_launch_args(vec![
+        let args = parse_launch_args(vec![
             OsString::from("--gl"),
             OsString::from("sample.json"),
             OsString::from("--"),
             OsString::from("--dx12"),
         ]);
-        assert_eq!(choice, RendererChoice::Glow);
+        assert_eq!(args.renderer, RendererChoice::Glow);
+        assert!(!args.new_window);
         assert_eq!(
-            files,
+            args.files,
             vec![PathBuf::from("sample.json"), PathBuf::from("--dx12")]
         );
 
-        let (choice, files) = parse_launch_args(vec![
+        let args = parse_launch_args(vec![
             OsString::from("--renderer=software"),
+            OsString::from(NEW_WINDOW_FLAG),
             OsString::from("audit.xml"),
         ]);
-        assert_eq!(choice, RendererChoice::WgpuSoftware);
-        assert_eq!(files, vec![PathBuf::from("audit.xml")]);
+        assert_eq!(args.renderer, RendererChoice::WgpuSoftware);
+        assert!(args.new_window);
+        assert_eq!(args.files, vec![PathBuf::from("audit.xml")]);
     }
 }

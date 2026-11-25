@@ -1,6 +1,7 @@
 use crate::{
     document::{self, Document, Kind},
     editor::{self, Editor},
+    settings::{self, Settings},
     tree::Tree,
     tree_style,
 };
@@ -28,6 +29,8 @@ const APP_TITLE: &str = "XML/JSON Viewer";
 pub const APP_ID: &str = "io.github.xmljsonviewer.Viewer";
 const DEBOUNCE: Duration = Duration::from_millis(350);
 const SEARCH_ID: &str = "search-input";
+const REPLACE_ID: &str = "replace-input";
+const TREE_MIN_WIDTH: f32 = 160.0;
 
 #[cfg(target_os = "windows")]
 fn set_native_dark_titlebar(creation: &eframe::CreationContext<'_>) {
@@ -330,6 +333,8 @@ impl Tab {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
     New,
+    NewWindow,
+    MoveToNewWindow(u64),
     Open,
     OpenEmbedded { tab: u64, node: usize },
     Save,
@@ -342,6 +347,9 @@ enum Action {
     Reveal,
     Format,
     Search,
+    Replace,
+    ReplaceNext,
+    ReplaceAll,
     Next,
     Previous,
     HideSearch,
@@ -368,11 +376,30 @@ pub struct App {
     open_requests: Option<mpsc::Receiver<Vec<PathBuf>>>,
     search_visible: bool,
     search_query: String,
+    search_case_sensitive: bool,
+    replace_visible: bool,
+    replace_text: String,
     focus_search: bool,
     focus_editor: bool,
     dialog: Option<Dialog>,
     closing: bool,
     title: String,
+    tree_width: f32,
+    tree_resized: bool,
+    open_files_in_new_window: bool,
+    persist_settings: bool,
+}
+
+fn spawn_window(files: &[PathBuf]) -> io::Result<()> {
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command.arg(crate::NEW_WINDOW_FLAG);
+    if !files.is_empty() {
+        command.arg("--").args(files);
+    }
+    let mut child = command.spawn()?;
+    // Reap the child when it exits so it does not linger as a zombie on Unix.
+    std::thread::spawn(move || child.wait());
+    Ok(())
 }
 
 fn file_dialog(frame: Option<&eframe::Frame>) -> rfd::FileDialog {
@@ -401,14 +428,43 @@ impl App {
             open_requests: None,
             search_visible: false,
             search_query: String::new(),
+            search_case_sensitive: true,
+            replace_visible: false,
+            replace_text: String::new(),
             focus_search: false,
             focus_editor: true,
             dialog: None,
             closing: false,
             title: String::new(),
+            tree_width: settings::DEFAULT_TREE_WIDTH,
+            tree_resized: false,
+            open_files_in_new_window: false,
+            persist_settings: false,
         };
         app.new_tab();
         app
+    }
+
+    fn apply_settings(&mut self, settings: Settings) {
+        self.tree_width = settings.tree_width.max(TREE_MIN_WIDTH);
+        self.open_files_in_new_window = settings.open_files_in_new_window;
+        self.search_case_sensitive = settings.search_case_sensitive;
+        self.persist_settings = true;
+    }
+
+    fn move_to_new_window(&mut self, id: u64) {
+        let Some(index) = self.index(id) else {
+            return;
+        };
+        let tab = &mut self.tabs[index];
+        let Some(path) = tab.path.clone().filter(|_| !tab.dirty && !tab.saving) else {
+            tab.status = "Save the tab before moving it to a new window".into();
+            return;
+        };
+        match spawn_window(&[path]) {
+            Ok(()) => self.remove_tab(index),
+            Err(error) => tab.status = format!("Could not open a new window: {error}"),
+        }
     }
 
     fn new_tab(&mut self) -> usize {
@@ -641,9 +697,40 @@ impl App {
 
     fn find(&mut self, backwards: bool) {
         let tab = &mut self.tabs[self.active];
-        tab.editor.set_search(&self.search_query);
+        tab.editor
+            .set_search(&self.search_query, self.search_case_sensitive);
         if !tab.editor.find(backwards) {
             tab.status = "No matches found".into();
+        }
+    }
+
+    fn toggle_search(&mut self, replace: bool) {
+        if self.search_visible && self.replace_visible == replace {
+            self.search_visible = false;
+            self.replace_visible = false;
+            self.focus_editor = true;
+        } else {
+            self.search_visible = true;
+            self.replace_visible = replace;
+            self.focus_search = true;
+        }
+    }
+
+    fn replace(&mut self, all: bool) {
+        let tab = &mut self.tabs[self.active];
+        if !tab.editor.editable {
+            tab.status = "Wait for the file to finish opening".into();
+            return;
+        }
+        tab.editor
+            .set_search(&self.search_query, self.search_case_sensitive);
+        if tab.editor.match_count() == 0 {
+            tab.status = "No matches found".into();
+        } else if all {
+            let count = tab.editor.replace_all(&self.replace_text);
+            tab.status = format!("Replaced {count} occurrence(s)");
+        } else {
+            tab.editor.replace_match(&self.replace_text);
         }
     }
 
@@ -723,6 +810,12 @@ impl App {
             Action::New => {
                 self.new_tab();
             }
+            Action::NewWindow => {
+                if let Err(error) = spawn_window(&[]) {
+                    self.tabs[index].status = format!("Could not open a new window: {error}");
+                }
+            }
+            Action::MoveToNewWindow(id) => self.move_to_new_window(id),
             Action::Open => {
                 let files = file_dialog(frame)
                     .set_title("Open XML/JSON")
@@ -742,14 +835,15 @@ impl App {
                 self.focus_editor = true;
             }
             Action::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
-            Action::Search if !self.search_visible => {
-                self.search_visible = true;
-                self.focus_search = true;
-            }
-            Action::Search | Action::HideSearch => {
+            Action::Search => self.toggle_search(false),
+            Action::Replace => self.toggle_search(true),
+            Action::HideSearch => {
                 self.search_visible = false;
+                self.replace_visible = false;
                 self.focus_editor = true;
             }
+            Action::ReplaceNext => self.replace(false),
+            Action::ReplaceAll => self.replace(true),
             Action::Next => self.find(false),
             Action::Previous => self.find(true),
             Action::Select => self.select_at_cursor(false),
@@ -799,6 +893,7 @@ impl App {
         // More specific shortcuts first: Ctrl+S also matches Ctrl+Shift+S logically.
         let mut table = vec![
             (command_shift, Key::S, Action::SaveAs),
+            (command_shift, Key::N, Action::NewWindow),
             (command, Key::S, Action::Save),
             (command, Key::T, Action::New),
             (command, Key::O, Action::Open),
@@ -807,11 +902,17 @@ impl App {
             (command, Key::E, Action::Select),
             (command, Key::L, Action::Reveal),
             (command, Key::I, Action::Format),
+            // Cmd+H hides the app on macOS, so Cmd+Option+F also opens replace.
+            (command | Modifiers::ALT, Key::F, Action::Replace),
+            (command, Key::H, Action::Replace),
             (command, Key::F, Action::Search),
             (Modifiers::SHIFT, Key::F3, Action::Previous),
             (Modifiers::NONE, Key::F3, Action::Next),
         ];
-        if !ctx.memory(|memory| memory.has_focus(Id::unique(SEARCH_ID))) {
+        let typing_in_search = ctx.memory(|memory| {
+            memory.has_focus(Id::unique(SEARCH_ID)) || memory.has_focus(Id::unique(REPLACE_ID))
+        });
+        if !typing_in_search {
             table.extend([
                 (command_shift, Key::Z, Action::Redo),
                 (command, Key::Z, Action::Undo),
@@ -930,6 +1031,7 @@ impl App {
                 ui.menu_button("File", |ui| {
                     for (label, action) in [
                         ("New tab", Action::New),
+                        ("New window", Action::NewWindow),
                         ("Open…", Action::Open),
                         ("Save", Action::Save),
                         ("Save as…", Action::SaveAs),
@@ -947,12 +1049,35 @@ impl App {
                         ("Decode selection", Action::Decode),
                         ("Format document", Action::Format),
                         ("Find", Action::Search),
+                        ("Replace", Action::Replace),
                         ("Undo", Action::Undo),
                         ("Redo", Action::Redo),
                     ] {
                         if ui.button(label).clicked() {
                             actions.push(action);
                         }
+                    }
+                });
+                ui.menu_button("Options", |ui| {
+                    let response = ui
+                        .checkbox(
+                            &mut self.open_files_in_new_window,
+                            "Open files in new windows",
+                        )
+                        .on_hover_text(
+                            "Files opened from the file explorer or the command line \
+                             start their own window instead of a tab",
+                        );
+                    if response.changed() && self.persist_settings {
+                        let value = self.open_files_in_new_window;
+                        settings::update(|settings| settings.open_files_in_new_window = value);
+                    }
+                    let response = ui
+                        .checkbox(&mut self.search_case_sensitive, "Case-sensitive search")
+                        .on_hover_text("Find and replace distinguish uppercase from lowercase");
+                    if response.changed() && self.persist_settings {
+                        let value = self.search_case_sensitive;
+                        settings::update(|settings| settings.search_case_sensitive = value);
                     }
                 });
             });
@@ -963,9 +1088,23 @@ impl App {
                         for (index, tab) in self.tabs.iter().enumerate() {
                             let label =
                                 format!("{}{}", tab.title(), if tab.dirty { " *" } else { "" });
-                            if ui.selectable_label(index == self.active, label).clicked() {
+                            let response = ui.selectable_label(index == self.active, label);
+                            if response.clicked() {
                                 actions.push(Action::Activate(index));
                             }
+                            response.context_menu(|ui| {
+                                let movable = tab.path.is_some() && !tab.dirty && !tab.saving;
+                                if ui
+                                    .add_enabled(movable, egui::Button::new("Move to new window"))
+                                    .on_disabled_hover_text("Save the tab first")
+                                    .clicked()
+                                {
+                                    actions.push(Action::MoveToNewWindow(tab.id));
+                                }
+                                if ui.button("Close tab").clicked() {
+                                    actions.push(Action::Close(tab.id));
+                                }
+                            });
                             if ui.small_button("×").on_hover_text("Close tab").clicked() {
                                 actions.push(Action::Close(tab.id));
                             }
@@ -1001,49 +1140,88 @@ impl App {
         } else {
             String::new()
         };
-        self.tabs[self.active].editor.set_search(&query);
+        self.tabs[self.active]
+            .editor
+            .set_search(&query, self.search_case_sensitive);
         if self.search_visible {
-            egui::Panel::bottom("search").show(ui, |ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    for (label, action) in [
-                        ("Close", Action::HideSearch),
-                        ("Next", Action::Next),
-                        ("Previous", Action::Previous),
-                    ] {
-                        if ui.button(label).clicked() {
-                            actions.push(action);
+            // Not resizable, so the panel grows when the replace row appears.
+            egui::Panel::bottom("search")
+                .resizable(false)
+                .show(ui, |ui| {
+                    // Fixed-height rows: a stretching layout would grow the panel every frame.
+                    let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                    let layout = Layout::right_to_left(Align::Center);
+                    ui.allocate_ui_with_layout(row, layout, |ui| {
+                        for (label, action) in [
+                            ("Close", Action::HideSearch),
+                            ("Next", Action::Next),
+                            ("Previous", Action::Previous),
+                        ] {
+                            if ui.button(label).clicked() {
+                                actions.push(action);
+                            }
                         }
-                    }
-                    let editor = &mut self.tabs[self.active].editor;
-                    if !self.search_query.is_empty() {
-                        ui.label(format!("{} matches", editor.match_count()));
-                    }
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.search_query)
-                            .id(Id::unique(SEARCH_ID))
-                            .hint_text("Find (case-sensitive)…")
-                            .desired_width(f32::INFINITY),
-                    );
-                    if std::mem::take(&mut self.focus_search) {
-                        response.request_focus();
-                    }
-                    if response.changed() {
-                        editor.set_search(&self.search_query);
-                    }
-                    if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
-                        actions.push(Action::Next);
-                        response.request_focus();
+                        let editor = &mut self.tabs[self.active].editor;
+                        if !self.search_query.is_empty() {
+                            ui.label(format!("{} matches", editor.match_count()));
+                        }
+                        let hint = if self.search_case_sensitive {
+                            "Find (case-sensitive)…"
+                        } else {
+                            "Find (ignoring case)…"
+                        };
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.search_query)
+                                .id(Id::unique(SEARCH_ID))
+                                .hint_text(hint)
+                                .desired_width(f32::INFINITY),
+                        );
+                        if std::mem::take(&mut self.focus_search) {
+                            response.request_focus();
+                        }
+                        if response.changed() {
+                            editor.set_search(&self.search_query, self.search_case_sensitive);
+                        }
+                        if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter))
+                        {
+                            actions.push(Action::Next);
+                            response.request_focus();
+                        }
+                    });
+                    if self.replace_visible {
+                        ui.allocate_ui_with_layout(row, layout, |ui| {
+                            for (label, action) in [
+                                ("Replace all", Action::ReplaceAll),
+                                ("Replace", Action::ReplaceNext),
+                            ] {
+                                if ui.button(label).clicked() {
+                                    actions.push(action);
+                                }
+                            }
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut self.replace_text)
+                                    .id(Id::unique(REPLACE_ID))
+                                    .hint_text("Replace with…")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            if response.lost_focus()
+                                && ui.input(|input| input.key_pressed(Key::Enter))
+                            {
+                                actions.push(Action::ReplaceNext);
+                                response.request_focus();
+                            }
+                        });
                     }
                 });
-            });
         }
 
         let tab = &mut self.tabs[self.active];
         let current = tab.tree_current();
-        egui::Panel::left("tree")
+        let pointer_down = ctx.input(|input| input.pointer.any_down());
+        let panel = egui::Panel::left("tree")
             .resizable(true)
-            .default_size(280.0)
-            .min_size(160.0)
+            .default_size(self.tree_width)
+            .min_size(TREE_MIN_WIDTH)
             .frame(egui::Frame::NONE.fill(tree_style::BACKGROUND))
             .show(ui, |ui| {
                 let chosen = ui
@@ -1057,6 +1235,19 @@ impl App {
                     None => {}
                 }
             });
+        let width = panel.response.rect.width();
+        if (width - self.tree_width).abs() > 0.5 {
+            self.tree_width = width;
+            // Only user drags are remembered, not clamping by a small window.
+            self.tree_resized |= pointer_down;
+        }
+        if self.tree_resized && !pointer_down {
+            self.tree_resized = false;
+            if self.persist_settings {
+                let width = self.tree_width;
+                settings::update(|settings| settings.tree_width = width);
+            }
+        }
         let focus = self.dialog.is_none() && std::mem::take(&mut self.focus_editor);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(editor::BACKGROUND))
@@ -1324,6 +1515,7 @@ pub fn run(
         cfg!(target_os = "windows"),
     );
     let requests = Arc::new(Mutex::new(Some(requests)));
+    let settings = settings::load();
     let mut last_error: Option<eframe::Error> = None;
 
     for (index, attempt) in plan.iter().copied().enumerate() {
@@ -1338,6 +1530,7 @@ pub fn run(
         let options = native_options(icon.clone(), attempt);
         let files_for_attempt = files.clone();
         let requests_for_attempt = requests.clone();
+        let settings_for_attempt = settings.clone();
         let initialized = Arc::new(AtomicBool::new(false));
         let initialized_flag = initialized.clone();
 
@@ -1358,6 +1551,7 @@ pub fn run(
                 #[cfg(target_os = "windows")]
                 set_native_dark_titlebar(creation);
                 let mut app = App::new(Some(creation.egui_ctx.clone()));
+                app.apply_settings(settings_for_attempt);
                 app.open_requests = requests_for_attempt
                     .lock()
                     .ok()

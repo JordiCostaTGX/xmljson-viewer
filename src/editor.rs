@@ -95,6 +95,7 @@ pub struct Editor {
     scroll: Option<Scroll>,
     layouts: HashMap<(usize, usize), LineLayout>,
     query: String,
+    case_sensitive: bool,
     matches: Vec<Range<usize>>,
     matches_version: u64,
     page_rows: usize,
@@ -118,6 +119,7 @@ impl Default for Editor {
             scroll: None,
             layouts: HashMap::new(),
             query: String::new(),
+            case_sensitive: true,
             matches: vec![],
             matches_version: u64::MAX,
             page_rows: 20,
@@ -137,6 +139,15 @@ fn class(ch: char) -> u8 {
 
 fn digits(value: usize) -> usize {
     value.max(1).ilog10() as usize + 1
+}
+
+/// Lowercases one char to one char so char offsets in folded text stay valid.
+fn fold(ch: char) -> char {
+    let mut lower = ch.to_lowercase();
+    match (lower.next(), lower.next()) {
+        (Some(folded), None) => folded,
+        _ => ch,
+    }
 }
 
 impl Editor {
@@ -281,11 +292,59 @@ impl Editor {
         true
     }
 
-    pub fn set_search(&mut self, query: &str) {
-        if self.query != query {
+    pub fn set_search(&mut self, query: &str, case_sensitive: bool) {
+        if self.query != query || self.case_sensitive != case_sensitive {
             self.query = query.into();
+            self.case_sensitive = case_sensitive;
             self.matches_version = u64::MAX;
         }
+    }
+
+    /// Replaces the selection if it is a match, then selects the next match.
+    pub fn replace_match(&mut self, replacement: &str) -> bool {
+        self.ensure_matches();
+        let selection = self.selection();
+        let selected = self
+            .matches
+            .binary_search_by_key(&selection.start, |m| m.start)
+            .is_ok_and(|index| self.matches[index].end == selection.end);
+        if selected {
+            self.replace(selection, replacement);
+        }
+        self.find(false);
+        selected
+    }
+
+    /// Replaces every match as one undoable action and returns how many there were.
+    pub fn replace_all(&mut self, replacement: &str) -> usize {
+        self.ensure_matches();
+        let Some(first) = self.matches.first().cloned() else {
+            return 0;
+        };
+        let before = (self.anchor, self.cursor);
+        let matches = std::mem::take(&mut self.matches);
+        // Back to front, so the stored start offsets stay valid for undo and redo.
+        let edits = matches
+            .iter()
+            .rev()
+            .map(|found| Edit {
+                start: found.start,
+                removed: self.apply(found.start, found.end, replacement),
+                inserted: replacement.into(),
+            })
+            .collect();
+        self.cursor = first.start;
+        self.anchor = first.start;
+        self.column = None;
+        self.sealed = true;
+        self.push(Group {
+            edits,
+            before,
+            after: (self.anchor, self.cursor),
+            typing: false,
+        });
+        self.reveal();
+        matches.len()
     }
 
     pub fn match_count(&mut self) -> usize {
@@ -323,10 +382,15 @@ impl Editor {
         if self.query.is_empty() {
             return;
         }
-        let text = self.rope.to_string();
-        let length = self.query.chars().count();
+        let mut text = self.rope.to_string();
+        let mut query = self.query.clone();
+        if !self.case_sensitive {
+            text = text.chars().map(fold).collect();
+            query = query.chars().map(fold).collect();
+        }
+        let length = query.chars().count();
         let (mut byte, mut chars) = (0, 0);
-        for (at, _) in text.match_indices(self.query.as_str()) {
+        for (at, _) in text.match_indices(query.as_str()) {
             chars += text[byte..at].chars().count();
             byte = at;
             self.matches.push(chars..chars + length);
@@ -1107,7 +1171,7 @@ mod tests {
     #[test]
     fn search_counts_unicode_matches_and_wraps() {
         let mut editor = editor("é x é x");
-        editor.set_search("x");
+        editor.set_search("x", true);
         assert_eq!(editor.match_count(), 2);
         assert!(editor.find(false));
         assert_eq!(editor.selection(), 2..3);
@@ -1119,6 +1183,39 @@ mod tests {
         assert_eq!(editor.selection(), 6..7);
         editor.replace(0..0, "x");
         assert_eq!(editor.match_count(), 3);
+    }
+
+    #[test]
+    fn case_insensitive_search_keeps_char_offsets() {
+        let mut editor = editor("Éa éA éa");
+        editor.set_search("éa", true);
+        assert_eq!(editor.match_count(), 1);
+        editor.set_search("ÉA", false);
+        assert_eq!(editor.match_count(), 3);
+        assert!(editor.find(false));
+        assert!(editor.find(false));
+        assert_eq!(editor.selection(), 3..5);
+        assert_eq!(editor.selected_text(), "éA");
+    }
+
+    #[test]
+    fn replace_selects_first_then_replaces_and_replace_all_is_one_undo() {
+        let mut editor = editor("a-b-a-b");
+        editor.set_search("a", true);
+        assert!(!editor.replace_match("xyz"), "first press only selects");
+        assert_eq!(editor.selection(), 0..1);
+        assert!(editor.replace_match("xyz"));
+        assert_eq!(editor.text(), "xyz-b-a-b");
+        assert_eq!(editor.selected_text(), "a");
+
+        editor.set_search("B", false);
+        assert_eq!(editor.replace_all("éé"), 2);
+        assert_eq!(editor.text(), "xyz-éé-a-éé");
+        assert_eq!(editor.match_count(), 0);
+        assert!(editor.undo());
+        assert_eq!(editor.text(), "xyz-b-a-b");
+        assert!(editor.redo());
+        assert_eq!(editor.text(), "xyz-éé-a-éé");
     }
 
     #[test]

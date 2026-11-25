@@ -3,8 +3,8 @@ use crate::{
     tree_style,
 };
 use eframe::egui::{
-    Color32, EventFilter, FontId, Id, Key, Modifiers, ScrollArea, Sense, Shape, Stroke, Ui, pos2,
-    vec2,
+    Color32, EventFilter, FontId, Id, Key, Modifiers, Rect, ScrollArea, Sense, Shape, Stroke, Ui,
+    pos2, vec2,
 };
 use std::{borrow::Cow, collections::HashSet, sync::Arc};
 
@@ -259,7 +259,7 @@ impl Tree {
         }
         let enabled = ui.is_enabled();
         let mut toggled = None;
-        area.show_rows(ui, row_height, self.rows.len(), |ui, range| {
+        let output = area.show_rows(ui, row_height, self.rows.len(), |ui, range| {
             for index in range {
                 let row = Row {
                     key: self.rows[index].key,
@@ -356,6 +356,20 @@ impl Tree {
                 }
             }
         });
+        let viewport = output.inner_rect;
+        let rows_end = viewport.top() + output.content_size.y - output.state.clamped_offset().y;
+        if rows_end < viewport.bottom() && !self.rows.is_empty() {
+            let empty = Rect::from_min_max(pos2(viewport.left(), rows_end), viewport.max);
+            if ui
+                .interact(empty, id.with("empty"), Sense::click())
+                .clicked()
+            {
+                ui.ctx().memory_mut(|memory| memory.request_focus(id));
+                if let Some(node) = self.select_row(self.rows.len() - 1) {
+                    chosen = Some(TreeAction::Select(node));
+                }
+            }
+        }
         if let Some(index) = self.keep_visible.take() {
             self.scroll_to = Some(index);
             ui.ctx().request_repaint();
@@ -435,5 +449,43 @@ mod tests {
         let rows = tree.rows.len();
         tree.toggle(RowKey::Node(target));
         assert_eq!(tree.rows.len(), rows - 1);
+    }
+
+    #[test]
+    fn clicking_below_the_rows_selects_the_last_row() {
+        use eframe::egui::{Context, Event, PointerButton, RawInput};
+
+        let (mut tree, document) = tree("<r><a/><b/></r>", Kind::Xml);
+        let last = *document.nodes[document.roots[0]].children.last().unwrap();
+        let ctx = Context::default();
+        let id = Id::unique("tree");
+        let pos = pos2(100.0, 500.0);
+        let mut chosen = None;
+        for pressed in [None, Some(true), Some(false)] {
+            let mut events = vec![Event::PointerMoved(pos)];
+            if let Some(pressed) = pressed {
+                events.push(Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                });
+            }
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 600.0))),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| {
+                if let Some(action) = tree.ui(ui, id) {
+                    chosen = Some(action);
+                }
+            })
+            .textures_delta
+            .clear();
+        }
+        assert_eq!(tree.selected, Some(RowKey::Node(last)));
+        assert!(matches!(chosen, Some(TreeAction::Select(node)) if node == last));
+        assert!(ctx.memory(|memory| memory.has_focus(id)));
     }
 }
