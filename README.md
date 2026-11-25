@@ -75,15 +75,26 @@ launch crashed natively during graphics setup — the viewer automatically falls
 back to OpenGL (`glow`) and then software (`WARP`) rendering for older PCs,
 VMs, and RDP sessions.
 
-You can also force a specific backend via command-line flag or `XMLJSON_RENDERER`:
+A native driver crash ends the process before the viewer can react, so the
+launch on which it happens closes without a dialog; the next launch starts
+with a fallback renderer. The last backend that worked is stored in
+`graphics-renderer` next to `startup.log` and tried first on later launches,
+so an affected PC does not crash again on every other start. Delete that file
+to return to the default order.
+
+You can also force a specific backend via command-line flag or
+`XMLJSON_RENDERER` (`auto`, `wgpu`, `dx12`, `software`, `gl`). Forced
+backends are not remembered:
 
 ```sh
 xmljson-viewer --gl        # Force OpenGL (glow)
 xmljson-viewer --dx12      # Force DirectX 12 (wgpu)
 xmljson-viewer --software  # Force software rendering (WARP)
-``` File contents and
-command-line paths are not logged routinely, but error or panic messages
-can contain paths or other diagnostic details; review logs before sharing.
+```
+
+File contents and command-line paths are not logged routinely, but error or
+panic messages can contain paths or other diagnostic details; review logs
+before sharing.
 
 If Windows blocks execution before the application starts, or a required
 DLL cannot be loaded, no application log or dialog may be produced. Check

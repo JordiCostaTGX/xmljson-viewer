@@ -64,15 +64,30 @@ impl StartupLog {
         self.directory.join("graphics-init.pending")
     }
 
+    fn remembered_renderer_path(&self) -> PathBuf {
+        self.directory.join("graphics-renderer")
+    }
+
     fn write(&self, message: &str) {
         if let Ok(mut file) = self.file.lock() {
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default();
-            let _ = writeln!(file, "[{}] {message}", timestamp.as_secs_f64());
-            let _ = file.flush();
+            write_line(&mut file, message);
         }
     }
+
+    // A crashing thread may already hold the lock; blocking would hang instead of exiting.
+    fn try_write(&self, message: &str) {
+        if let Ok(mut file) = self.file.try_lock() {
+            write_line(&mut file, message);
+        }
+    }
+}
+
+fn write_line(file: &mut File, message: &str) {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let _ = writeln!(file, "[{}] {message}", timestamp.as_secs_f64());
+    let _ = file.flush();
 }
 
 #[cfg(target_os = "windows")]
@@ -94,16 +109,23 @@ unsafe extern "system" fn unhandled_exception_filter(
                 0x8000_0003 => "STATUS_BREAKPOINT",
                 _ => "UNKNOWN_EXCEPTION",
             };
-            record(&format!(
+            record_without_blocking(&format!(
                 "FATAL: Unhandled Windows exception 0x{code:08X} ({label}) at 0x{address:016X}"
             ));
         } else {
-            record("FATAL: Unhandled Windows exception (no exception record)");
+            record_without_blocking("FATAL: Unhandled Windows exception (no exception record)");
         }
     } else {
-        record("FATAL: Unhandled Windows exception (null pointers)");
+        record_without_blocking("FATAL: Unhandled Windows exception (null pointers)");
     }
     EXCEPTION_CONTINUE_SEARCH
+}
+
+#[cfg(target_os = "windows")]
+fn record_without_blocking(message: &str) {
+    if let Some(log) = LOG.get() {
+        log.try_write(message);
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -164,6 +186,18 @@ pub fn mark_graphics_init_started(attempt: &str) {
 pub fn mark_graphics_init_succeeded() {
     if let Some(log) = LOG.get() {
         let _ = fs::remove_file(log.pending_marker_path());
+    }
+}
+
+pub fn remembered_renderer() -> Option<String> {
+    let content = fs::read_to_string(LOG.get()?.remembered_renderer_path()).ok()?;
+    let trimmed = content.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+pub fn remember_renderer(attempt: &str) {
+    if let Some(log) = LOG.get() {
+        let _ = fs::write(log.remembered_renderer_path(), attempt);
     }
 }
 

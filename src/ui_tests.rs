@@ -445,7 +445,7 @@ fn renders_frames_headless() {
 #[test]
 fn startup_plan_orders_dx12_glow_and_software_fallbacks() {
     assert_eq!(
-        startup_plan(RendererChoice::Auto, None, true),
+        startup_plan(RendererChoice::Auto, None, None, true),
         vec![
             StartupAttempt::WgpuDx12,
             StartupAttempt::Glow,
@@ -453,7 +453,7 @@ fn startup_plan_orders_dx12_glow_and_software_fallbacks() {
         ]
     );
     assert_eq!(
-        startup_plan(RendererChoice::Auto, Some("wgpu-dx12"), true),
+        startup_plan(RendererChoice::Auto, Some("wgpu-dx12"), None, true),
         vec![
             StartupAttempt::Glow,
             StartupAttempt::WgpuSoftware,
@@ -461,7 +461,7 @@ fn startup_plan_orders_dx12_glow_and_software_fallbacks() {
         ]
     );
     assert_eq!(
-        startup_plan(RendererChoice::Auto, Some("glow"), true),
+        startup_plan(RendererChoice::Auto, Some("glow"), None, true),
         vec![
             StartupAttempt::WgpuSoftware,
             StartupAttempt::WgpuDx12,
@@ -469,15 +469,55 @@ fn startup_plan_orders_dx12_glow_and_software_fallbacks() {
         ]
     );
     assert_eq!(
-        startup_plan(RendererChoice::Auto, None, false),
+        startup_plan(RendererChoice::Auto, None, None, false),
         vec![StartupAttempt::WgpuDefault, StartupAttempt::Glow]
     );
     assert_eq!(
-        startup_plan(RendererChoice::Glow, None, true),
+        startup_plan(RendererChoice::Glow, None, None, true),
         vec![StartupAttempt::Glow]
     );
     assert_eq!(
-        startup_plan(RendererChoice::WgpuSoftware, None, true),
+        startup_plan(RendererChoice::WgpuSoftware, None, None, true),
         vec![StartupAttempt::WgpuSoftware]
+    );
+}
+
+#[test]
+fn startup_plan_keeps_last_working_backend_after_a_crash_fallback() {
+    assert_eq!(
+        startup_plan(RendererChoice::Auto, None, Some("glow"), true),
+        vec![
+            StartupAttempt::Glow,
+            StartupAttempt::WgpuDx12,
+            StartupAttempt::WgpuSoftware,
+        ]
+    );
+    assert_eq!(
+        startup_plan(RendererChoice::Auto, None, Some("wgpu-software"), true),
+        vec![
+            StartupAttempt::WgpuSoftware,
+            StartupAttempt::WgpuDx12,
+            StartupAttempt::Glow,
+        ]
+    );
+    assert_eq!(
+        startup_plan(RendererChoice::Auto, Some("glow"), Some("glow"), true),
+        vec![
+            StartupAttempt::WgpuSoftware,
+            StartupAttempt::WgpuDx12,
+            StartupAttempt::Glow,
+        ]
+    );
+    assert_eq!(
+        startup_plan(RendererChoice::Auto, None, Some("unknown"), true),
+        vec![
+            StartupAttempt::WgpuDx12,
+            StartupAttempt::Glow,
+            StartupAttempt::WgpuSoftware,
+        ]
+    );
+    assert_eq!(
+        startup_plan(RendererChoice::WgpuDx12, None, Some("glow"), true),
+        vec![StartupAttempt::WgpuDx12]
     );
 }

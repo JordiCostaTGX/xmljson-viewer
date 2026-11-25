@@ -1149,6 +1149,7 @@ impl StartupAttempt {
 fn startup_plan(
     choice: RendererChoice,
     previous_crash: Option<&str>,
+    remembered: Option<&str>,
     is_windows: bool,
 ) -> Vec<StartupAttempt> {
     match choice {
@@ -1158,7 +1159,7 @@ fn startup_plan(
         RendererChoice::Glow => return vec![StartupAttempt::Glow],
         RendererChoice::Auto => {}
     }
-    if is_windows {
+    let mut plan = if is_windows {
         match previous_crash {
             Some("wgpu-dx12") | Some("wgpu") => vec![
                 StartupAttempt::Glow,
@@ -1181,7 +1182,17 @@ fn startup_plan(
             Some("wgpu") => vec![StartupAttempt::Glow, StartupAttempt::WgpuDefault],
             _ => vec![StartupAttempt::WgpuDefault, StartupAttempt::Glow],
         }
+    };
+    // A native driver crash cannot be retried in-process, so keep starting with what worked.
+    if previous_crash.is_none()
+        && let Some(index) = plan
+            .iter()
+            .position(|attempt| Some(attempt.id()) == remembered)
+    {
+        let attempt = plan.remove(index);
+        plan.insert(0, attempt);
     }
+    plan
 }
 
 fn select_wgpu_adapter(
@@ -1300,9 +1311,16 @@ pub fn run(
             "Previous launch did not finish graphics initialization ({failed}); prioritizing fallback renderer"
         ));
     }
+    let remembered = (choice == RendererChoice::Auto)
+        .then(crate::diagnostics::remembered_renderer)
+        .flatten();
+    if let Some(renderer) = &remembered {
+        crate::diagnostics::record(&format!("Last working graphics backend: {renderer}"));
+    }
     let plan = startup_plan(
         choice,
         previous_crash.as_deref(),
+        remembered.as_deref(),
         cfg!(target_os = "windows"),
     );
     let requests = Arc::new(Mutex::new(Some(requests)));
@@ -1328,6 +1346,9 @@ pub fn run(
             options,
             Box::new(move |creation| {
                 crate::diagnostics::mark_graphics_init_succeeded();
+                if choice == RendererChoice::Auto {
+                    crate::diagnostics::remember_renderer(attempt.id());
+                }
                 initialized_flag.store(true, Ordering::Relaxed);
                 crate::diagnostics::record(&format!(
                     "Window and graphics context created ({}); initializing editor",
