@@ -75,6 +75,7 @@ impl StartupLog {
     }
 
     // A crashing thread may already hold the lock; blocking would hang instead of exiting.
+    #[cfg(target_os = "windows")]
     fn try_write(&self, message: &str) {
         if let Ok(mut file) = self.file.try_lock() {
             write_line(&mut file, message);

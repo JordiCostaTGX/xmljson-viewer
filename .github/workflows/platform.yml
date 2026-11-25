@@ -1,0 +1,114 @@
+name: Platform build
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        type: string
+        required: true
+      artifact:
+        type: string
+        required: true
+      check-format:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libfontconfig1-dev
+
+      - name: Set up Rust
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add clippy rustfmt
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Check formatting
+        if: inputs.check-format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ARTIFACT: ${{ inputs.artifact }}
+        run: |
+          $dir = "dist/$env:ARTIFACT"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target/release/xmljson-viewer.exe, README.md, resources/icon-provenance.txt $dir
+          Compress-Archive -Path $dir -DestinationPath "dist/$env:ARTIFACT.zip"
+
+      - name: Package (Linux/macOS)
+        if: runner.os != 'Windows'
+        env:
+          ARTIFACT: ${{ inputs.artifact }}
+        run: |
+          dir="dist/$ARTIFACT"
+          mkdir -p "$dir/bin" "$dir/resources"
+          cp target/release/xmljson-viewer "$dir/bin/"
+          cp README.md install.sh xmljson-viewer.desktop "$dir/"
+          cp resources/visor-mascot.png resources/icon-provenance.txt "$dir/resources/"
+          tar -C dist -czf "dist/$ARTIFACT.tar.gz" "$ARTIFACT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}
+          path: dist/${{ inputs.artifact }}.*
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact }}
+          path: dist
+
+      - name: Publish to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+              exit 0
+            fi
+            if gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --generate-notes; then
+              exit 0
+            fi
+            # Another platform may have created the release concurrently.
+            sleep 10
+          done
+          exit 1
