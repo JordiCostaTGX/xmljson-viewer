@@ -4,6 +4,7 @@ use crate::{
     settings::{self, Settings},
     theme::Theme,
     tree::Tree,
+    update::{CURRENT_VERSION, Release},
 };
 use eframe::egui::{self, Align, Id, Key, KeyboardShortcut, Layout, Modifiers, ViewportCommand};
 use std::{
@@ -473,6 +474,7 @@ enum Action {
     ParseJson,
     ExpandAll,
     CollapseAll,
+    CheckForUpdates,
     Decode,
 }
 
@@ -525,6 +527,18 @@ pub struct App {
     persist_settings: bool,
     theme: Theme,
     applied_theme: Option<Theme>,
+    repaint: Option<egui::Context>,
+    check_for_updates: bool,
+    skipped_version: String,
+    update_available: Option<Release>,
+    /// "Later" hides the notice for this session only.
+    update_dismissed: bool,
+    update_replies: Option<mpsc::Receiver<UpdateCheck>>,
+}
+
+struct UpdateCheck {
+    result: Result<Release, String>,
+    manual: bool,
 }
 
 fn spawn_window(files: &[PathBuf]) -> io::Result<()> {
@@ -551,6 +565,7 @@ fn file_dialog(frame: Option<&eframe::Frame>) -> rfd::FileDialog {
 
 impl App {
     fn new(ctx: Option<egui::Context>) -> Self {
+        let repaint = ctx.clone();
         let (jobs, replies) = worker(move || {
             if let Some(ctx) = &ctx {
                 ctx.request_repaint();
@@ -582,6 +597,12 @@ impl App {
             persist_settings: false,
             theme: Theme::default(),
             applied_theme: None,
+            repaint,
+            check_for_updates: true,
+            skipped_version: String::new(),
+            update_available: None,
+            update_dismissed: false,
+            update_replies: None,
         };
         app.new_tab();
         app
@@ -593,7 +614,93 @@ impl App {
         self.search_case_sensitive = settings.search_case_sensitive;
         self.decode_on_open = settings.decode_on_open;
         self.theme = Theme::from_id(&settings.theme);
+        self.check_for_updates = settings.check_for_updates;
+        self.skipped_version = settings.skipped_version;
+        self.offer_update(
+            Release {
+                version: settings.latest_version,
+            },
+            false,
+        );
         self.persist_settings = true;
+    }
+
+    /// Runs off the UI thread; `manual` checks report their outcome in the status bar.
+    fn start_update_check(&mut self, manual: bool) {
+        if self.update_replies.is_some() {
+            return;
+        }
+        let (send, receive) = mpsc::channel();
+        let repaint = self.repaint.clone();
+        std::thread::spawn(move || {
+            let result = crate::update::fetch_latest();
+            let _ = send.send(UpdateCheck { result, manual });
+            if let Some(ctx) = repaint {
+                ctx.request_repaint();
+            }
+        });
+        self.update_replies = Some(receive);
+        if manual {
+            self.tabs[self.active].status = "Checking for updates…".into();
+        }
+    }
+
+    fn poll_update_check(&mut self) {
+        let Some(receiver) = &self.update_replies else {
+            return;
+        };
+        let check = match receiver.try_recv() {
+            Ok(check) => check,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.update_replies = None;
+                return;
+            }
+        };
+        self.update_replies = None;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        match check.result {
+            Ok(release) => {
+                if self.persist_settings {
+                    let version = release.version.clone();
+                    settings::update(|settings| {
+                        settings.last_update_check = now;
+                        settings.latest_version = version;
+                    });
+                }
+                if check.manual {
+                    self.tabs[self.active].status =
+                        if crate::update::is_newer(&release.version, CURRENT_VERSION) {
+                            format!("Version {} is available", release.version)
+                        } else {
+                            format!("You have the latest version ({CURRENT_VERSION})")
+                        };
+                }
+                self.offer_update(release, check.manual);
+            }
+            Err(error) => {
+                // Also recorded on failure, so an offline PC does not retry on every launch.
+                if self.persist_settings {
+                    settings::update(|settings| settings.last_update_check = now);
+                }
+                crate::diagnostics::record(&format!("Update check failed: {error}"));
+                if check.manual {
+                    self.tabs[self.active].status = format!("Could not check for updates: {error}");
+                }
+            }
+        }
+    }
+
+    /// A skipped version is only offered again when the user checks manually.
+    fn offer_update(&mut self, release: Release, manual: bool) {
+        if !crate::update::is_newer(&release.version, CURRENT_VERSION) {
+            self.update_available = None;
+        } else if manual || release.version != self.skipped_version {
+            self.update_dismissed = false;
+            self.update_available = Some(release);
+        }
     }
 
     fn move_to_new_window(&mut self, id: u64) {
@@ -1336,6 +1443,7 @@ impl App {
             Action::ParseJson => self.parse(index, Some(Kind::Json)),
             Action::ExpandAll => self.tabs[index].tree.expand_all(),
             Action::CollapseAll => self.tabs[index].tree.collapse_all(),
+            Action::CheckForUpdates => self.start_update_check(true),
         }
     }
 
@@ -1530,6 +1638,7 @@ impl App {
         let palette = self.theme.palette();
         self.poll();
         self.quit_when_saved(&ctx);
+        self.poll_update_check();
         self.receive_open_requests(&ctx);
         let dropped: Vec<PathBuf> = ctx.input(|input| {
             input
@@ -1618,6 +1727,23 @@ impl App {
                             }
                         }
                     });
+                    let response = ui
+                        .checkbox(&mut self.check_for_updates, "Check for updates at startup")
+                        .on_hover_text("At most once a day; asks GitHub for the latest release");
+                    if response.changed() && self.persist_settings {
+                        let value = self.check_for_updates;
+                        settings::update(|settings| settings.check_for_updates = value);
+                    }
+                });
+                ui.menu_button("Help", |ui| {
+                    ui.label(format!("{APP_TITLE} {CURRENT_VERSION}"));
+                    if ui.button("Check for updates").clicked() {
+                        actions.push(Action::CheckForUpdates);
+                    }
+                    if ui.button("Releases page").clicked() {
+                        ui.ctx()
+                            .open_url(egui::OpenUrl::new_tab(crate::update::RELEASES_PAGE));
+                    }
                 });
             });
             egui::ScrollArea::horizontal()
@@ -1652,6 +1778,37 @@ impl App {
                     });
                 });
         });
+
+        if let Some(release) = self.update_available.clone()
+            && !self.update_dismissed
+        {
+            egui::Panel::top("update").resizable(false).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "A new version {} is available (you have {CURRENT_VERSION}).",
+                        release.version
+                    ));
+                    if ui
+                        .button("Download…")
+                        .on_hover_text("Opens the release page with the downloads and what's new")
+                        .clicked()
+                    {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(release.url()));
+                    }
+                    if ui.button("Skip this version").clicked() {
+                        self.update_available = None;
+                        self.skipped_version = release.version.clone();
+                        if self.persist_settings {
+                            let version = release.version.clone();
+                            settings::update(|settings| settings.skipped_version = version);
+                        }
+                    }
+                    if ui.button("Later").clicked() {
+                        self.update_dismissed = true;
+                    }
+                });
+            });
+        }
 
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2105,7 +2262,17 @@ pub fn run(
                     attempt.description()
                 ));
                 let mut app = App::new(Some(creation.egui_ctx.clone()));
+                let update_due = crate::update::should_check(
+                    settings_for_attempt.check_for_updates,
+                    settings_for_attempt.last_update_check,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |elapsed| elapsed.as_secs()),
+                );
                 app.apply_settings(settings_for_attempt);
+                if update_due {
+                    app.start_update_check(false);
+                }
                 // Applied before the first frame so the window does not flash the default theme.
                 app.theme.apply(&creation.egui_ctx);
                 #[cfg(target_os = "windows")]

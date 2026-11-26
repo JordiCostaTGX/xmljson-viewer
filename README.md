@@ -48,6 +48,18 @@ cargo build --release --locked
 
 Release builds on Windows do not open a console window.
 
+## Updates
+
+At startup, at most once a day, the viewer asks GitHub in the background
+for the latest release (`api.github.com`, nothing else is sent). If a newer
+version exists, a bar under the tabs offers **Download…** (opens the release
+page), **Skip this version** or **Later**. Network errors are silent.
+**Help › Check for updates** checks immediately and reports the result in
+the status bar; **Options › Check for updates at startup** turns the
+automatic check off. HTTPS uses the operating system's certificate store,
+and proxies are taken from the `HTTPS_PROXY`/`ALL_PROXY` environment
+variables.
+
 ## Startup diagnostics
 
 Every process appends to the shared `startup.log` file in

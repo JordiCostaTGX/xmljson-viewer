@@ -409,6 +409,59 @@ fn save_all_and_quit_saves_every_modified_tab_before_closing() {
 }
 
 #[test]
+fn update_checks_offer_newer_versions_and_respect_skipped_ones() {
+    let mut app = App::new(None);
+    let check = |app: &mut App, version: &str, manual: bool| {
+        let (send, receive) = mpsc::channel();
+        app.update_replies = Some(receive);
+        send.send(UpdateCheck {
+            result: Ok(Release {
+                version: version.into(),
+            }),
+            manual,
+        })
+        .unwrap();
+        app.poll_update_check();
+        assert!(app.update_replies.is_none());
+    };
+    check(&mut app, "999.0.0", false);
+    assert_eq!(app.update_available.as_ref().unwrap().version, "999.0.0");
+
+    app.update_available = None;
+    app.skipped_version = "999.0.0".into();
+    check(&mut app, "999.0.0", false);
+    assert!(
+        app.update_available.is_none(),
+        "skipped versions stay quiet"
+    );
+    check(&mut app, "999.0.0", true);
+    assert!(
+        app.update_available.is_some(),
+        "a manual check shows it again"
+    );
+    assert_eq!(app.tabs[0].status, "Version 999.0.0 is available");
+
+    check(&mut app, CURRENT_VERSION, true);
+    assert!(app.update_available.is_none());
+    assert!(
+        app.tabs[0]
+            .status
+            .starts_with("You have the latest version")
+    );
+
+    let (send, receive) = mpsc::channel();
+    app.update_replies = Some(receive);
+    send.send(UpdateCheck {
+        result: Err("offline".into()),
+        manual: false,
+    })
+    .unwrap();
+    let status = app.tabs[0].status.clone();
+    app.poll_update_check();
+    assert_eq!(app.tabs[0].status, status, "automatic failures are silent");
+}
+
+#[test]
 fn parse_errors_are_kept_for_the_tree_hint_until_the_text_parses() {
     let mut app = App::new(None);
     app.tabs[0].editor.set_text("log line {\"a\":");
