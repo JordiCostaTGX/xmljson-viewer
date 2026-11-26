@@ -718,7 +718,10 @@ fn decode_on_open_applies_to_files_inside_a_zip() {
     wait(&mut app, |app| {
         app.tabs[0].editor.text().contains("\"id\": 1")
     });
-    assert!(app.tabs[0].dirty);
+    assert!(
+        !app.tabs[0].dirty,
+        "the zip on disk is unchanged, as with regular files"
+    );
     assert!(app.tabs[0].path.is_none());
     assert_eq!(app.tabs[0].title(), "wrapped.json");
     assert!(app.tabs[0].editor.undo());

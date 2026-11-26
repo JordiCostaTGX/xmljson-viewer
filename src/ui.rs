@@ -92,7 +92,9 @@ enum Task {
     ListZip(PathBuf),
     OpenZip {
         path: PathBuf,
-        include: Option<Vec<bool>>,
+        indices: Vec<usize>,
+        /// Entries the listing already skipped, reported together with any skipped now.
+        skipped: usize,
     },
     Format(Arc<str>, Kind),
     /// Selected text, whole source, selected char range, and whether it was triggered by opening.
@@ -122,7 +124,7 @@ struct OpenedSet {
 
 struct ZipListing {
     path: PathBuf,
-    names: Vec<String>,
+    entries: Vec<crate::archive::ListedEntry>,
     skipped: usize,
 }
 
@@ -173,9 +175,11 @@ fn worker(notify: impl Fn() + Send + 'static) -> (mpsc::Sender<Job>, mpsc::Recei
                 }
                 Task::Open(path) => Output::Opened(open_path(&path, &cancelled)),
                 Task::ListZip(path) => Output::Listed(list_zip(&path, &cancelled)),
-                Task::OpenZip { path, include } => {
-                    Output::Opened(open_zip(&path, include.as_deref(), &cancelled))
-                }
+                Task::OpenZip {
+                    path,
+                    indices,
+                    skipped,
+                } => Output::Opened(open_zip(&path, &indices, skipped, &cancelled)),
                 Task::Format(text, kind) => Output::Formatted(document::format(&text, kind)),
                 Task::Decode(selected, source, start, end, on_open) => {
                     let source_len = source.chars().count();
@@ -213,20 +217,19 @@ fn list_zip(path: &Path, cancelled: &impl Fn() -> bool) -> Result<ZipListing, St
     let listed = crate::archive::list_text_files(path, cancelled)?;
     Ok(ZipListing {
         path: path.to_path_buf(),
-        names: listed.names,
+        entries: listed.entries,
         skipped: listed.skipped,
     })
 }
 
 fn open_zip(
     path: &Path,
-    include: Option<&[bool]>,
+    indices: &[usize],
+    skipped: usize,
     cancelled: &impl Fn() -> bool,
 ) -> Result<OpenedSet, String> {
-    let read = match include {
-        Some(include) => crate::archive::read_selected(path, include, cancelled)?,
-        None => crate::archive::read_text_files(path, cancelled)?,
-    };
+    let read = crate::archive::read_entries(path, indices, cancelled)?;
+    let notice = crate::archive::notice(skipped + read.skipped, read.truncated);
     let documents = read
         .entries
         .into_iter()
@@ -237,10 +240,7 @@ fn open_zip(
             prepare_document(None, entry.name, entry.text, forces_json, cancelled)
         })
         .collect();
-    Ok(OpenedSet {
-        documents,
-        notice: read.notice,
-    })
+    Ok(OpenedSet { documents, notice })
 }
 
 fn open_path(path: &Path, cancelled: &impl Fn() -> bool) -> Result<OpenedSet, String> {
@@ -344,6 +344,8 @@ struct Tab {
     status: String,
     parse_count: usize,
     parse_error: Option<String>,
+    /// Entries skipped while opening a zip, kept for the status after decode on open.
+    open_notice: String,
 }
 
 impl Tab {
@@ -367,6 +369,7 @@ impl Tab {
             status: "Ready".into(),
             parse_count: 0,
             parse_error: None,
+            open_notice: String::new(),
         }
     }
 
@@ -380,6 +383,16 @@ impl Tab {
             .and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| self.untitled_name.clone())
+    }
+
+    /// Zip entries are titled with their folder inside the archive; only the last part is a file name.
+    fn suggested_file_name(&self) -> String {
+        let title = self.title();
+        title
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&title)
+            .to_string()
     }
 
     fn set_kind(&mut self, kind: Kind) {
@@ -472,6 +485,7 @@ enum Dialog {
 struct ZipPrompt {
     path: PathBuf,
     names: Vec<String>,
+    indices: Vec<usize>,
     skipped: usize,
     picking: bool,
     selected: Vec<bool>,
@@ -673,24 +687,26 @@ impl App {
     fn present_zip(&mut self, result: Result<ZipListing, String>) {
         match result {
             Err(error) => self.tabs[self.active].status = error,
-            Ok(listing) if listing.names.is_empty() => {
+            Ok(listing) if listing.entries.is_empty() => {
                 self.tabs[self.active].status = if listing.skipped == 0 {
                     "The archive has no text files".into()
                 } else {
-                    format!(
-                        "Skipped {} entries that could not be opened as text",
-                        listing.skipped
-                    )
+                    crate::archive::notice(listing.skipped, false)
                 };
             }
             Ok(listing) => {
-                let selected = vec![false; listing.names.len()];
+                let (indices, names): (Vec<usize>, Vec<String>) = listing
+                    .entries
+                    .into_iter()
+                    .map(|entry| (entry.index, entry.name))
+                    .unzip();
                 self.dialog = Some(Dialog::Zip(ZipPrompt {
                     path: listing.path,
-                    names: listing.names,
+                    selected: vec![false; names.len()],
+                    names,
+                    indices,
                     skipped: listing.skipped,
                     picking: false,
-                    selected,
                 }));
             }
         }
@@ -700,15 +716,26 @@ impl App {
         let Some(Dialog::Zip(prompt)) = self.dialog.take() else {
             return;
         };
-        if !all && !prompt.selected.iter().any(|chosen| *chosen) {
-            self.dialog = Some(Dialog::Zip(prompt));
-            return;
-        }
-        let include = if all { None } else { Some(prompt.selected) };
-        self.open_zip_files(prompt.path, include);
+        let (indices, skipped) = if all {
+            (prompt.indices, prompt.skipped)
+        } else {
+            let chosen: Vec<usize> = prompt
+                .indices
+                .iter()
+                .zip(&prompt.selected)
+                .filter(|(_, selected)| **selected)
+                .map(|(index, _)| *index)
+                .collect();
+            if chosen.is_empty() {
+                self.dialog = Some(Dialog::Zip(prompt));
+                return;
+            }
+            (chosen, 0)
+        };
+        self.open_zip_files(prompt.path, indices, skipped);
     }
 
-    fn open_zip_files(&mut self, path: PathBuf, include: Option<Vec<bool>>) {
+    fn open_zip_files(&mut self, path: PathBuf, indices: Vec<usize>, skipped: usize) {
         let reuse = self.tabs.get(self.active).is_some_and(|tab| {
             !tab.dirty && tab.path.is_none() && tab.editor.len_chars() == 0 && tab.editor.editable
         });
@@ -717,7 +744,14 @@ impl App {
         tab.revision.fetch_add(1, Ordering::Relaxed);
         tab.editor.editable = false;
         tab.status = format!("Opening {}…", path.display());
-        self.submit(index, Task::OpenZip { path, include });
+        self.submit(
+            index,
+            Task::OpenZip {
+                path,
+                indices,
+                skipped,
+            },
+        );
     }
 
     fn clear_archive_check_status(&mut self) {
@@ -943,20 +977,14 @@ impl App {
                 }
                 Output::Formatted(Err(error)) => tab.status = format!("Formatting error: {error}"),
                 Output::Decoded(Ok(Some(text)), start, end, on_open) => {
-                    let kept = tab
-                        .status
-                        .split(" · ")
-                        .filter(|part| part.starts_with("Skipped") || part.starts_with("Stopped"))
-                        .collect::<Vec<_>>()
-                        .join(" · ");
                     tab.editor.replace(start..end, &text);
                     tab.note_changes(Instant::now());
                     if on_open {
-                        // A saved file can be reopened. A zip entry exists only in this tab.
-                        tab.dirty = tab.path.is_none();
+                        // Nothing on disk changed: the file or zip can be opened again.
+                        tab.dirty = false;
                         tab.status = "Decoded on open; Ctrl+Z restores the original text".into();
-                        if !kept.is_empty() {
-                            tab.status = format!("{} · {kept}", tab.status);
+                        if !tab.open_notice.is_empty() {
+                            tab.status = format!("{} · {}", tab.status, tab.open_notice);
                         }
                     } else {
                         tab.status = "Selection decoded and document structured".into();
@@ -1027,10 +1055,11 @@ impl App {
                 if !notice.is_empty() {
                     let tab = &mut self.tabs[self.active];
                     tab.status = if tab.status.is_empty() {
-                        notice
+                        notice.clone()
                     } else {
                         format!("{} · {notice}", tab.status)
                     };
+                    tab.open_notice = notice;
                 }
                 installed
             }
@@ -1173,15 +1202,9 @@ impl App {
 
     fn save_with_dialog(&mut self, index: usize, frame: Option<&eframe::Frame>) {
         let tab = &mut self.tabs[index];
-        let title = tab.title();
-        let file_name = title
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(title.as_str())
-            .to_string();
         match file_dialog(frame)
             .set_title("Save as")
-            .set_file_name(&file_name)
+            .set_file_name(tab.suggested_file_name())
             .save_file()
         {
             Some(path) => self.save_to(index, path),
@@ -1461,7 +1484,7 @@ impl App {
                     self.active = index;
                     let chosen = file_dialog(frame)
                         .set_title("Save as")
-                        .set_file_name(tab.title())
+                        .set_file_name(tab.suggested_file_name())
                         .save_file();
                     let Some(path) = chosen else {
                         self.tabs[index].status = "Quit cancelled".into();
