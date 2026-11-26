@@ -377,6 +377,49 @@ fn decode_without_selection_structures_xml_document() {
 }
 
 #[test]
+fn save_all_and_quit_saves_every_modified_tab_before_closing() {
+    let ctx = egui::Context::default();
+    let mut app = App::new(None);
+    let paths: Vec<PathBuf> = (0..2)
+        .map(|index| unique_path(&format!("xmljson-quit-{index}")).with_extension("json"))
+        .collect();
+    for (index, path) in paths.iter().enumerate() {
+        if index > 0 {
+            app.new_tab();
+        }
+        let tab = &mut app.tabs[index];
+        tab.path = Some(path.clone());
+        tab.editor.set_text(&format!("{{\"tab\":{index}}}"));
+        tab.dirty = true;
+    }
+    app.save_all_and_quit(None);
+    assert!(app.quit_after_save);
+    app.quit_when_saved(&ctx);
+    assert!(!app.closing, "waits for the saves to finish");
+    wait(&mut app, |app| app.tabs.iter().all(|tab| !tab.saving));
+    app.quit_when_saved(&ctx);
+    assert!(app.closing);
+    for (index, path) in paths.iter().enumerate() {
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            format!("{{\"tab\":{index}}}")
+        );
+        fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn parse_errors_are_kept_for_the_tree_hint_until_the_text_parses() {
+    let mut app = App::new(None);
+    app.tabs[0].editor.set_text("log line {\"a\":");
+    app.parse(0, Some(Kind::Json));
+    wait(&mut app, |app| app.tabs[0].parse_count == 1);
+    assert!(app.tabs[0].parse_error.is_some());
+    load(&mut app, 0, r#"{"a":1}"#, Kind::Json);
+    assert!(app.tabs[0].parse_error.is_none());
+}
+
+#[test]
 fn decode_on_open_structures_the_file_without_marking_it_dirty() {
     let path = unique_path("xmljson-decode-on-open").with_extension("json");
     let original = r#"{"auditData":{"data":"{\"request\":{\"id\":1}}"}}"#;

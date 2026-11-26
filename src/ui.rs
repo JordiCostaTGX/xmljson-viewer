@@ -343,6 +343,7 @@ struct Tab {
     close_after_save: bool,
     status: String,
     parse_count: usize,
+    parse_error: Option<String>,
 }
 
 impl Tab {
@@ -365,6 +366,7 @@ impl Tab {
             close_after_save: false,
             status: "Ready".into(),
             parse_count: 0,
+            parse_error: None,
         }
     }
 
@@ -408,8 +410,12 @@ impl Tab {
                 self.status = format!("{} nodes · analysis up to date", document.nodes.len());
                 self.document = Some(document);
                 self.document_revision = revision;
+                self.parse_error = None;
             }
-            Err(error) => self.status = error,
+            Err(error) => {
+                self.parse_error = Some(error.clone());
+                self.status = error;
+            }
         }
     }
 
@@ -497,6 +503,7 @@ pub struct App {
     dialog: Option<Dialog>,
     archive_token: Arc<AtomicU64>,
     closing: bool,
+    quit_after_save: bool,
     title: String,
     tree_width: f32,
     tree_resized: bool,
@@ -553,6 +560,7 @@ impl App {
             dialog: None,
             archive_token: Arc::new(AtomicU64::new(0)),
             closing: false,
+            quit_after_save: false,
             title: String::new(),
             tree_width: settings::DEFAULT_TREE_WIDTH,
             tree_resized: false,
@@ -1382,8 +1390,8 @@ impl App {
             },
             Dialog::Quit => (
                 "There are unsaved tabs or a save in progress".into(),
-                "Cancel to save your changes before quitting.",
-                &["Cancel", "Discard and quit"],
+                "Save them, discard the changes, or cancel to keep working.",
+                &["Cancel", "Discard and quit", "Save all and quit"],
             ),
             Dialog::Zip(_) => return,
         };
@@ -1435,7 +1443,52 @@ impl App {
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
             }
+            (Dialog::Quit, 2) => self.save_all_and_quit(frame),
             _ => {}
+        }
+    }
+
+    /// Saves every modified tab (asking for a path for untitled ones); quits once all saves finish.
+    fn save_all_and_quit(&mut self, frame: Option<&eframe::Frame>) {
+        for index in 0..self.tabs.len() {
+            let tab = &self.tabs[index];
+            if !tab.dirty || tab.saving {
+                continue;
+            }
+            let path = match tab.path.clone() {
+                Some(path) => path,
+                None => {
+                    self.active = index;
+                    let chosen = file_dialog(frame)
+                        .set_title("Save as")
+                        .set_file_name(tab.title())
+                        .save_file();
+                    let Some(path) = chosen else {
+                        self.tabs[index].status = "Quit cancelled".into();
+                        return;
+                    };
+                    path
+                }
+            };
+            self.save_to(index, path);
+            if !self.tabs[index].saving {
+                return;
+            }
+        }
+        self.quit_after_save = true;
+    }
+
+    fn quit_when_saved(&mut self, ctx: &egui::Context) {
+        if !self.quit_after_save || self.tabs.iter().any(|tab| tab.saving) {
+            return;
+        }
+        self.quit_after_save = false;
+        if let Some(index) = self.tabs.iter().position(|tab| tab.dirty) {
+            // A failed save keeps its error in the status bar; stay open so nothing is lost.
+            self.active = index;
+        } else {
+            self.closing = true;
+            ctx.send_viewport_cmd(ViewportCommand::Close);
         }
     }
 
@@ -1453,6 +1506,7 @@ impl App {
         }
         let palette = self.theme.palette();
         self.poll();
+        self.quit_when_saved(&ctx);
         self.receive_open_requests(&ctx);
         let dropped: Vec<PathBuf> = ctx.input(|input| {
             input
@@ -1688,6 +1742,19 @@ impl App {
             .min_size(TREE_MIN_WIDTH)
             .frame(egui::Frame::NONE.fill(palette.background))
             .show(ui, |ui| {
+                if let Some(error) = &tab.parse_error
+                    && tab.editor.len_chars() > 0
+                {
+                    egui::Frame::NONE.inner_margin(8).show(ui, |ui| {
+                        ui.strong("No tree: the text is not valid JSON or XML");
+                        ui.weak(error.as_str());
+                        ui.label(
+                            "For escaped logs use Decode (or Options › Decode files on open); \
+                             otherwise try Parse to JSON / Parse to XML.",
+                        );
+                    });
+                    ui.separator();
+                }
                 let chosen = ui
                     .add_enabled_ui(current, |ui| {
                         tab.tree.ui(ui, Id::unique(("tree", tab.id)), palette)

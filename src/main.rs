@@ -108,7 +108,8 @@ fn main() {
         new_window,
         files,
     } = parse_launch_args(args);
-    let new_window = new_window || (!files.is_empty() && settings::load().open_files_in_new_window);
+    // Launching without files (e.g. middle-click on the taskbar icon) asks for another window.
+    let new_window = new_window || files.is_empty() || settings::load().open_files_in_new_window;
     diagnostics::record(&format!(
         "Open requests: {} file(s); renderer preference: {renderer_choice:?}; new window: {new_window}",
         files.len()

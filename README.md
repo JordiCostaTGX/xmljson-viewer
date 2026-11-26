@@ -12,7 +12,9 @@ Every tagged release (`v*`) is built by GitHub Actions and published on the
 repository's **Releases** page:
 
 - **Windows**: download `xmljson-viewer-windows-x86_64.zip`, extract it
-  and run `xmljson-viewer.exe`. Nothing else has to be installed.
+  and run `xmljson-viewer.exe`. Nothing else has to be installed: the
+  C runtime is linked statically (`.cargo/config.toml`), so the Visual C++
+  Redistributable (`VCRUNTIME140.dll`) is not needed.
   Files can be opened from the menu, by drag-and-drop, or with
   _Open with…_ in Explorer.
 - **Linux**: download `xmljson-viewer-linux-x86_64.tar.gz`, extract it
@@ -143,6 +145,8 @@ SmartScreen warnings. Benchmark mode does not create startup logs or dialogs.
   match and replaces it on the next press; **Replace all** changes every
   match as a single undoable edit.
 - Save/Save as, dirty indicators, and confirmation before discarding edits.
+  When quitting with unsaved tabs, **Save all and quit** saves every modified
+  tab (asking for a name for untitled ones) and closes once all saves finish.
   Saving writes a temporary file next to the target and renames it over
   the original in the background. Edits made after a save starts remain
   marked as unsaved.
@@ -188,8 +192,9 @@ block automatically. Only the first root is expanded on initial load.
 XML supports multiple-root fragments and undeclared prefixes; it does not
 validate schemas or resolve custom/external DTD entities. JSON uses
 `serde_json`'s depth limit (128); XML is limited to 512 levels. The safety
-limit is two million nodes. Parse errors appear in the status bar; a stale
-tree is disabled until it matches the current text.
+limit is two million nodes. Parse errors appear in the status bar and at
+the top of the tree panel; a stale tree is disabled until it matches the
+current text.
 
 XML formatting preserves comments, CDATA, declarations, and prefixes.
 Documents containing mixed text and elements are left unchanged rather
@@ -200,7 +205,9 @@ which can corrupt Unicode.
 Files opened from the file explorer or the command line go to a new tab in
 the first window that was opened. Enable **Options › Open files in new
 windows** to give each of them its own window instead, or pass
-`--new-window` on the command line. If that first window is closed while
+`--new-window` on the command line. Launching the viewer without files
+(for example middle-click or Shift+click on its taskbar icon) always opens
+a new window. If that first window is closed while
 others remain, the next file opens in a new window. Settings are stored in
 `settings.json` under `%LOCALAPPDATA%\xmljson-viewer` on Windows,
 `~/Library/Application Support/xmljson-viewer` on macOS, and
