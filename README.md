@@ -115,6 +115,11 @@ SmartScreen warnings. Benchmark mode does not create startup logs or dialogs.
   (for example with Win+← / Win+→).
 - Open multiple files through the menu, command-line arguments, or
   drag-and-drop.
+- Open a `.zip` the same way: the viewer counts its text documents and asks
+  whether to open all of them (up to 200) or only the ones you pick. Each
+  opens in its own tab. Entries are read in memory and never extracted to
+  disk; binary, encrypted and oversized entries (over 32 MB each, 128 MB in
+  total) are skipped and reported in the status bar.
 - Click a tree item to select its source text. `Ctrl+E` selects the element
   at the cursor and reveals its tree path. `Ctrl+L` also expands that node
   and scrolls it into view. Clicking the node's text toggles expansion,

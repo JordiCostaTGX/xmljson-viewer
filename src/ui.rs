@@ -84,9 +84,18 @@ fn set_native_titlebar(
     }
 }
 
+const ARCHIVE_JOB: u64 = u64::MAX;
+
 enum Task {
     Parse(Arc<str>, Kind),
     Open(PathBuf),
+    ListZip(PathBuf),
+    OpenZip {
+        path: PathBuf,
+        indices: Vec<usize>,
+        /// Entries the listing already skipped, reported together with any skipped now.
+        skipped: usize,
+    },
     Format(Arc<str>, Kind),
     /// Selected text, whole source, selected char range, and whether it was triggered by opening.
     Decode(String, String, usize, usize, bool),
@@ -100,14 +109,29 @@ struct Job {
     task: Task,
 }
 
+struct OpenedDocument {
+    path: Option<PathBuf>,
+    name: String,
+    kind: Kind,
+    parsed: Result<Arc<Document>, String>,
+    text: Option<Arc<str>>,
+}
+
+struct OpenedSet {
+    documents: Vec<OpenedDocument>,
+    notice: String,
+}
+
+struct ZipListing {
+    path: PathBuf,
+    entries: Vec<crate::archive::ListedEntry>,
+    skipped: usize,
+}
+
 enum Output {
     Parsed(Result<Arc<Document>, String>),
-    Opened(
-        PathBuf,
-        Kind,
-        Result<Arc<Document>, String>,
-        Option<Arc<str>>,
-    ),
+    Opened(Result<OpenedSet, String>),
+    Listed(Result<ZipListing, String>),
     Formatted(Result<String, String>),
     Decoded(Result<Option<String>, String>, usize, usize, bool),
     Saved(PathBuf, Result<(), String>),
@@ -149,27 +173,13 @@ fn worker(notify: impl Fn() + Send + 'static) -> (mpsc::Sender<Job>, mpsc::Recei
                 Task::Parse(text, kind) => {
                     Output::Parsed(document::parse(text, kind, cancelled).map(Arc::new))
                 }
-                Task::Open(path) => match fs::read_to_string(&path) {
-                    Ok(text) => {
-                        let kind = if path
-                            .extension()
-                            .is_some_and(|e| e.eq_ignore_ascii_case("json"))
-                        {
-                            Kind::Json
-                        } else {
-                            Kind::detect(&text)
-                        };
-                        let text: Arc<str> = text.into();
-                        let parsed = document::parse(text.clone(), kind, cancelled).map(Arc::new);
-                        Output::Opened(path, kind, parsed, Some(text))
-                    }
-                    Err(error) => Output::Opened(
-                        path,
-                        Kind::Xml,
-                        Err(format!("Could not open file: {error}")),
-                        None,
-                    ),
-                },
+                Task::Open(path) => Output::Opened(open_path(&path, &cancelled)),
+                Task::ListZip(path) => Output::Listed(list_zip(&path, &cancelled)),
+                Task::OpenZip {
+                    path,
+                    indices,
+                    skipped,
+                } => Output::Opened(open_zip(&path, &indices, skipped, &cancelled)),
                 Task::Format(text, kind) => Output::Formatted(document::format(&text, kind)),
                 Task::Decode(selected, source, start, end, on_open) => {
                     let source_len = source.chars().count();
@@ -201,6 +211,84 @@ fn worker(notify: impl Fn() + Send + 'static) -> (mpsc::Sender<Job>, mpsc::Recei
         }
     });
     (send, receive)
+}
+
+fn list_zip(path: &Path, cancelled: &impl Fn() -> bool) -> Result<ZipListing, String> {
+    let listed = crate::archive::list_text_files(path, cancelled)?;
+    Ok(ZipListing {
+        path: path.to_path_buf(),
+        entries: listed.entries,
+        skipped: listed.skipped,
+    })
+}
+
+fn open_zip(
+    path: &Path,
+    indices: &[usize],
+    skipped: usize,
+    cancelled: &impl Fn() -> bool,
+) -> Result<OpenedSet, String> {
+    let read = crate::archive::read_entries(path, indices, cancelled)?;
+    let notice = crate::archive::notice(skipped + read.skipped, read.truncated);
+    let documents = read
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let forces_json = Path::new(&entry.name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+            prepare_document(None, entry.name, entry.text, forces_json, cancelled)
+        })
+        .collect();
+    Ok(OpenedSet { documents, notice })
+}
+
+fn open_path(path: &Path, cancelled: &impl Fn() -> bool) -> Result<OpenedSet, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let forces_json = path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Untitled".into());
+            Ok(OpenedSet {
+                documents: vec![prepare_document(
+                    Some(path.to_path_buf()),
+                    name,
+                    text,
+                    forces_json,
+                    cancelled,
+                )],
+                notice: String::new(),
+            })
+        }
+        Err(error) => Err(format!("Could not open file: {error}")),
+    }
+}
+
+fn prepare_document(
+    path: Option<PathBuf>,
+    name: String,
+    text: String,
+    forces_json: bool,
+    cancelled: &impl Fn() -> bool,
+) -> OpenedDocument {
+    let kind = if forces_json {
+        Kind::Json
+    } else {
+        Kind::detect(&text)
+    };
+    let text: Arc<str> = text.into();
+    let parsed = document::parse(text.clone(), kind, cancelled).map(Arc::new);
+    OpenedDocument {
+        path,
+        name,
+        kind,
+        parsed,
+        text: Some(text),
+    }
 }
 
 /// Writes to a sibling temporary file and renames it over the target.
@@ -249,13 +337,15 @@ struct Tab {
     debounce: Option<Instant>,
     kind: Option<Kind>,
     path: Option<PathBuf>,
-    untitled_name: &'static str,
+    untitled_name: String,
     dirty: bool,
     saving: bool,
     close_after_save: bool,
     status: String,
     parse_count: usize,
     parse_error: Option<String>,
+    /// Entries skipped while opening a zip, kept for the status after decode on open.
+    open_notice: String,
 }
 
 impl Tab {
@@ -272,13 +362,14 @@ impl Tab {
             debounce: None,
             kind: None,
             path: None,
-            untitled_name: "Untitled",
+            untitled_name: "Untitled".into(),
             dirty: false,
             saving: false,
             close_after_save: false,
             status: "Ready".into(),
             parse_count: 0,
             parse_error: None,
+            open_notice: String::new(),
         }
     }
 
@@ -291,7 +382,17 @@ impl Tab {
             .as_ref()
             .and_then(|path| path.file_name())
             .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.untitled_name.into())
+            .unwrap_or_else(|| self.untitled_name.clone())
+    }
+
+    /// Zip entries are titled with their folder inside the archive; only the last part is a file name.
+    fn suggested_file_name(&self) -> String {
+        let title = self.title();
+        title
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&title)
+            .to_string()
     }
 
     fn set_kind(&mut self, kind: Kind) {
@@ -375,10 +476,27 @@ enum Action {
     Decode,
 }
 
-#[derive(Clone, Copy)]
 enum Dialog {
     CloseTab(u64),
     Quit,
+    Zip(ZipPrompt),
+}
+
+struct ZipPrompt {
+    path: PathBuf,
+    names: Vec<String>,
+    indices: Vec<usize>,
+    skipped: usize,
+    picking: bool,
+    selected: Vec<bool>,
+}
+
+enum ZipAction {
+    All,
+    Pick,
+    Selected,
+    Back,
+    Cancel,
 }
 
 pub struct App {
@@ -397,6 +515,7 @@ pub struct App {
     focus_search: bool,
     focus_editor: bool,
     dialog: Option<Dialog>,
+    archive_token: Arc<AtomicU64>,
     closing: bool,
     quit_after_save: bool,
     title: String,
@@ -422,7 +541,7 @@ fn spawn_window(files: &[PathBuf]) -> io::Result<()> {
 
 fn file_dialog(frame: Option<&eframe::Frame>) -> rfd::FileDialog {
     let dialog = rfd::FileDialog::new()
-        .add_filter("XML and JSON", &["xml", "json"])
+        .add_filter("XML, JSON and ZIP", &["xml", "json", "zip"])
         .add_filter("All files", &["*"]);
     match frame {
         Some(frame) => dialog.set_parent(frame),
@@ -453,6 +572,7 @@ impl App {
             focus_search: false,
             focus_editor: true,
             dialog: None,
+            archive_token: Arc::new(AtomicU64::new(0)),
             closing: false,
             quit_after_save: false,
             title: String::new(),
@@ -530,6 +650,29 @@ impl App {
     }
 
     fn open(&mut self, path: PathBuf) {
+        if crate::archive::is_zip(&path) {
+            self.queue_zip_listing(path);
+            return;
+        }
+        self.open_file(path);
+    }
+
+    fn queue_zip_listing(&mut self, path: PathBuf) {
+        let revision = self.archive_token.fetch_add(1, Ordering::Relaxed) + 1;
+        let job = Job {
+            tab: ARCHIVE_JOB,
+            revision,
+            current: self.archive_token.clone(),
+            task: Task::ListZip(path),
+        };
+        if self.jobs.send(job).is_err() {
+            self.tabs[self.active].status = "Error: parsing worker unavailable".into();
+        } else {
+            self.tabs[self.active].status = "Checking archive…".into();
+        }
+    }
+
+    fn open_file(&mut self, path: PathBuf) {
         let reuse = self.tabs.get(self.active).is_some_and(|tab| {
             !tab.dirty && tab.path.is_none() && tab.editor.len_chars() == 0 && tab.editor.editable
         });
@@ -539,6 +682,186 @@ impl App {
         tab.editor.editable = false;
         tab.status = format!("Opening {}…", path.display());
         self.submit(index, Task::Open(path));
+    }
+
+    fn present_zip(&mut self, result: Result<ZipListing, String>) {
+        match result {
+            Err(error) => self.tabs[self.active].status = error,
+            Ok(listing) if listing.entries.is_empty() => {
+                self.tabs[self.active].status = if listing.skipped == 0 {
+                    "The archive has no text files".into()
+                } else {
+                    crate::archive::notice(listing.skipped, false)
+                };
+            }
+            Ok(listing) => {
+                let (indices, names): (Vec<usize>, Vec<String>) = listing
+                    .entries
+                    .into_iter()
+                    .map(|entry| (entry.index, entry.name))
+                    .unzip();
+                self.dialog = Some(Dialog::Zip(ZipPrompt {
+                    path: listing.path,
+                    selected: vec![false; names.len()],
+                    names,
+                    indices,
+                    skipped: listing.skipped,
+                    picking: false,
+                }));
+            }
+        }
+    }
+
+    fn open_confirmed_zip(&mut self, all: bool) {
+        let Some(Dialog::Zip(prompt)) = self.dialog.take() else {
+            return;
+        };
+        let (indices, skipped) = if all {
+            (prompt.indices, prompt.skipped)
+        } else {
+            let chosen: Vec<usize> = prompt
+                .indices
+                .iter()
+                .zip(&prompt.selected)
+                .filter(|(_, selected)| **selected)
+                .map(|(index, _)| *index)
+                .collect();
+            if chosen.is_empty() {
+                self.dialog = Some(Dialog::Zip(prompt));
+                return;
+            }
+            (chosen, 0)
+        };
+        self.open_zip_files(prompt.path, indices, skipped);
+    }
+
+    fn open_zip_files(&mut self, path: PathBuf, indices: Vec<usize>, skipped: usize) {
+        let reuse = self.tabs.get(self.active).is_some_and(|tab| {
+            !tab.dirty && tab.path.is_none() && tab.editor.len_chars() == 0 && tab.editor.editable
+        });
+        let index = if reuse { self.active } else { self.new_tab() };
+        let tab = &mut self.tabs[index];
+        tab.revision.fetch_add(1, Ordering::Relaxed);
+        tab.editor.editable = false;
+        tab.status = format!("Opening {}…", path.display());
+        self.submit(
+            index,
+            Task::OpenZip {
+                path,
+                indices,
+                skipped,
+            },
+        );
+    }
+
+    fn clear_archive_check_status(&mut self) {
+        let tab = &mut self.tabs[self.active];
+        if tab.status == "Checking archive…" {
+            tab.status = "Ready".into();
+        }
+    }
+
+    fn show_zip_dialog(&mut self, ctx: &egui::Context) {
+        let mut action = None;
+        let mut toggles = Vec::new();
+        if let Some(Dialog::Zip(prompt)) = self.dialog.as_mut() {
+            let count = prompt.names.len();
+            let heading = if count == 1 {
+                "This file contains 1 document.".to_string()
+            } else {
+                format!("This file contains {count} documents.")
+            };
+            let selected_count = prompt.selected.iter().filter(|chosen| **chosen).count();
+            let response = egui::Modal::new(Id::unique("zip-open")).show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.heading(heading);
+                if prompt.skipped > 0 {
+                    ui.label(format!(
+                        "Skipped {} entries that could not be opened as text",
+                        prompt.skipped
+                    ));
+                }
+                if count > crate::archive::MAX_FILES {
+                    ui.label(format!(
+                        "Open all keeps the first {}.",
+                        crate::archive::MAX_FILES
+                    ));
+                }
+                ui.add_space(8.0);
+                if prompt.picking {
+                    ui.label(format!("{selected_count} selected"));
+                    egui::ScrollArea::vertical()
+                        .max_height(280.0)
+                        .show(ui, |ui| {
+                            for (index, name) in prompt.names.iter().enumerate() {
+                                let mut checked = prompt.selected[index];
+                                let enabled = checked || selected_count < crate::archive::MAX_FILES;
+                                if ui
+                                    .add_enabled(enabled, egui::Checkbox::new(&mut checked, name))
+                                    .changed()
+                                {
+                                    toggles.push((index, checked));
+                                }
+                            }
+                        });
+                    ui.add_space(8.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add_enabled(selected_count > 0, egui::Button::new("Open selected"))
+                            .clicked()
+                        {
+                            action = Some(ZipAction::Selected);
+                        }
+                        if ui.button("Back").clicked() {
+                            action = Some(ZipAction::Back);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            action = Some(ZipAction::Cancel);
+                        }
+                    });
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .button(format!("Open all (up to {})", crate::archive::MAX_FILES))
+                            .clicked()
+                        {
+                            action = Some(ZipAction::All);
+                        }
+                        if ui.button("Select which to open").clicked() {
+                            action = Some(ZipAction::Pick);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            action = Some(ZipAction::Cancel);
+                        }
+                    });
+                }
+            });
+            for (index, checked) in toggles {
+                prompt.selected[index] = checked;
+            }
+            if action.is_none() && response.should_close() {
+                action = Some(ZipAction::Cancel);
+            }
+        }
+        match action {
+            Some(ZipAction::Pick) => {
+                if let Some(Dialog::Zip(prompt)) = self.dialog.as_mut() {
+                    prompt.picking = true;
+                }
+            }
+            Some(ZipAction::Back) => {
+                if let Some(Dialog::Zip(prompt)) = self.dialog.as_mut() {
+                    prompt.picking = false;
+                }
+            }
+            Some(ZipAction::Cancel) => {
+                self.dialog = None;
+                self.clear_archive_check_status();
+            }
+            Some(ZipAction::All) => self.open_confirmed_zip(true),
+            Some(ZipAction::Selected) => self.open_confirmed_zip(false),
+            None => {}
+        }
     }
 
     fn open_embedded(&mut self, tab_id: u64, node_id: usize) {
@@ -576,7 +899,8 @@ impl App {
         tab.untitled_name = match kind {
             Kind::Xml => "Embedded XML",
             Kind::Json => "Embedded JSON",
-        };
+        }
+        .into();
         tab.editor.set_text(&payload);
         tab.seen_version = tab.editor.version();
         self.parse(index, Some(kind));
@@ -615,87 +939,174 @@ impl App {
     }
 
     fn accept(&mut self, reply: Reply) {
-        let Some(index) = self.index(reply.tab) else {
+        let Reply {
+            tab: tab_id,
+            revision,
+            output,
+        } = reply;
+        let output = match output {
+            Output::Listed(result) => {
+                if revision == self.archive_token.load(Ordering::Relaxed) {
+                    self.present_zip(result);
+                }
+                return;
+            }
+            other => other,
+        };
+        let Some(index) = self.index(tab_id) else {
             return;
         };
-        let tab = &mut self.tabs[index];
-        if reply.revision != tab.revision() && !matches!(reply.output, Output::Saved(..)) {
-            return;
-        }
-        let mut decode_opened = false;
-        match reply.output {
-            Output::Parsed(parsed) => tab.install_document(reply.revision, parsed),
-            Output::Opened(path, kind, parsed, content) => {
-                tab.editor.editable = true;
-                if let Some(content) = content {
-                    tab.set_kind(kind);
-                    tab.editor.set_text(&content);
-                    tab.seen_version = tab.editor.version();
-                    tab.path = Some(path);
-                    tab.dirty = false;
-                    tab.install_document(reply.revision, parsed);
-                    decode_opened = self.decode_on_open && !content.is_empty();
-                } else if let Err(error) = parsed {
-                    tab.status = error;
-                }
+        let mut opened = None;
+        {
+            let tab = &mut self.tabs[index];
+            if revision != tab.revision() && !matches!(output, Output::Saved(..)) {
+                return;
             }
-            Output::Formatted(Ok(text)) => {
-                let len = tab.editor.len_chars();
-                tab.editor.replace(0..len, &text);
-                tab.editor.select_range(0, 0);
-                tab.note_changes(Instant::now());
-                tab.status =
+            match output {
+                Output::Listed(_) => return,
+                Output::Parsed(parsed) => tab.install_document(revision, parsed),
+                Output::Opened(result) => opened = Some(result),
+                Output::Formatted(Ok(text)) => {
+                    let len = tab.editor.len_chars();
+                    tab.editor.replace(0..len, &text);
+                    tab.editor.select_range(0, 0);
+                    tab.note_changes(Instant::now());
+                    tab.status =
                     "Document formatted; mixed XML content is preserved without added whitespace"
                         .into();
+                }
+                Output::Formatted(Err(error)) => tab.status = format!("Formatting error: {error}"),
+                Output::Decoded(Ok(Some(text)), start, end, on_open) => {
+                    tab.editor.replace(start..end, &text);
+                    tab.note_changes(Instant::now());
+                    if on_open {
+                        // Nothing on disk changed: the file or zip can be opened again.
+                        tab.dirty = false;
+                        tab.status = "Decoded on open; Ctrl+Z restores the original text".into();
+                        if !tab.open_notice.is_empty() {
+                            tab.status = format!("{} · {}", tab.status, tab.open_notice);
+                        }
+                    } else {
+                        tab.status = "Selection decoded and document structured".into();
+                    }
+                }
+                Output::Decoded(Ok(None), .., on_open) => {
+                    if !on_open {
+                        tab.status = "No escaped content to decode".into();
+                    }
+                }
+                Output::Decoded(Err(error), ..) => tab.status = format!("Decode error: {error}"),
+                Output::Saved(path, result) => {
+                    tab.saving = false;
+                    match result {
+                        Ok(()) => {
+                            tab.path = Some(path);
+                            let unchanged = revision == tab.revision();
+                            tab.dirty = !unchanged;
+                            tab.status = if unchanged {
+                                "Saved"
+                            } else {
+                                "Saved; newer edits are still pending"
+                            }
+                            .into();
+                            if std::mem::take(&mut tab.close_after_save) && unchanged {
+                                self.remove_tab(index);
+                            }
+                        }
+                        Err(error) => {
+                            tab.close_after_save = false;
+                            tab.status = error;
+                        }
+                    }
+                }
             }
-            Output::Formatted(Err(error)) => tab.status = format!("Formatting error: {error}"),
-            Output::Decoded(Ok(Some(text)), start, end, on_open) => {
-                tab.editor.replace(start..end, &text);
-                tab.note_changes(Instant::now());
-                if on_open {
-                    // The file on disk is untouched, so closing needs no confirmation.
-                    tab.dirty = false;
-                    tab.status = "Decoded on open; Ctrl+Z restores the original text".into();
+        }
+        if let Some(result) = opened {
+            self.finish_open(index, result);
+        }
+    }
+
+    fn finish_open(&mut self, index: usize, opened: Result<OpenedSet, String>) {
+        let installed = match opened {
+            Err(error) => {
+                let tab = &mut self.tabs[index];
+                tab.editor.editable = true;
+                tab.status = error;
+                return;
+            }
+            Ok(set) if set.documents.is_empty() => {
+                let tab = &mut self.tabs[index];
+                tab.editor.editable = true;
+                tab.status = if set.notice.is_empty() {
+                    "The archive has no text files".into()
                 } else {
-                    tab.status = "Selection decoded and document structured".into();
-                }
+                    set.notice
+                };
+                return;
             }
-            Output::Decoded(Ok(None), .., on_open) => {
-                if !on_open {
-                    tab.status = "No escaped content to decode".into();
+            Ok(set) => {
+                let notice = set.notice;
+                let mut installed = Vec::new();
+                for (offset, document) in set.documents.into_iter().enumerate() {
+                    let tab_index = if offset == 0 { index } else { self.new_tab() };
+                    self.install_opened(tab_index, document);
+                    installed.push(tab_index);
                 }
+                if !notice.is_empty() {
+                    let tab = &mut self.tabs[self.active];
+                    tab.status = if tab.status.is_empty() {
+                        notice.clone()
+                    } else {
+                        format!("{} · {notice}", tab.status)
+                    };
+                    tab.open_notice = notice;
+                }
+                installed
             }
-            Output::Decoded(Err(error), ..) => tab.status = format!("Decode error: {error}"),
-            Output::Saved(path, result) => {
-                tab.saving = false;
-                match result {
-                    Ok(()) => {
-                        tab.path = Some(path);
-                        let unchanged = reply.revision == tab.revision();
-                        tab.dirty = !unchanged;
-                        tab.status = if unchanged {
-                            "Saved"
-                        } else {
-                            "Saved; newer edits are still pending"
-                        }
-                        .into();
-                        if std::mem::take(&mut tab.close_after_save) && unchanged {
-                            self.remove_tab(index);
-                        }
-                    }
-                    Err(error) => {
-                        tab.close_after_save = false;
-                        tab.status = error;
-                    }
-                }
+        };
+        if self.decode_on_open {
+            for tab_index in installed {
+                self.decode_opened_tab(tab_index);
             }
         }
-        if decode_opened {
-            let tab = &self.tabs[index];
-            let source = tab.editor.text();
-            let end = tab.editor.len_chars();
-            self.submit(index, Task::Decode(source.clone(), source, 0, end, true));
+    }
+
+    fn install_opened(&mut self, index: usize, document: OpenedDocument) {
+        let revision = self.tabs[index].revision();
+        let tab = &mut self.tabs[index];
+        tab.editor.editable = true;
+        let OpenedDocument {
+            path,
+            name,
+            kind,
+            parsed,
+            text,
+        } = document;
+        let Some(text) = text else {
+            if let Err(error) = parsed {
+                tab.status = error;
+            }
+            return;
+        };
+        tab.set_kind(kind);
+        tab.editor.set_text(&text);
+        tab.seen_version = tab.editor.version();
+        tab.path = path;
+        tab.dirty = false;
+        if tab.path.is_none() {
+            tab.untitled_name = name;
         }
+        tab.install_document(revision, parsed);
+    }
+
+    fn decode_opened_tab(&mut self, index: usize) {
+        let tab = &self.tabs[index];
+        if tab.editor.len_chars() == 0 {
+            return;
+        }
+        let source = tab.editor.text();
+        let end = tab.editor.len_chars();
+        self.submit(index, Task::Decode(source.clone(), source, 0, end, true));
     }
 
     /// Returns how long until the next pending analysis is due.
@@ -793,7 +1204,7 @@ impl App {
         let tab = &mut self.tabs[index];
         match file_dialog(frame)
             .set_title("Save as")
-            .set_file_name(tab.title())
+            .set_file_name(tab.suggested_file_name())
             .save_file()
         {
             Some(path) => self.save_to(index, path),
@@ -860,7 +1271,7 @@ impl App {
             Action::MoveToNewWindow(id) => self.move_to_new_window(id),
             Action::Open => {
                 let files = file_dialog(frame)
-                    .set_title("Open XML/JSON")
+                    .set_title("Open XML, JSON or ZIP")
                     .pick_files()
                     .unwrap_or_default();
                 for path in files {
@@ -979,8 +1390,14 @@ impl App {
     }
 
     fn show_dialog(&mut self, ctx: &egui::Context, frame: Option<&eframe::Frame>) {
-        let Some(dialog) = self.dialog else {
+        if matches!(self.dialog, Some(Dialog::Zip(_))) {
+            self.show_zip_dialog(ctx);
             return;
+        }
+        let dialog = match self.dialog {
+            Some(Dialog::CloseTab(id)) => Dialog::CloseTab(id),
+            Some(Dialog::Quit) => Dialog::Quit,
+            _ => return,
         };
         let (heading, detail, buttons): (String, &str, &[&str]) = match dialog {
             Dialog::CloseTab(id) => match self.index(id) {
@@ -999,6 +1416,7 @@ impl App {
                 "Save them, discard the changes, or cancel to keep working.",
                 &["Cancel", "Discard and quit", "Save all and quit"],
             ),
+            Dialog::Zip(_) => return,
         };
         let mut choice = None;
         let response = egui::Modal::new(Id::unique("confirm")).show(ctx, |ui| {
@@ -1066,7 +1484,7 @@ impl App {
                     self.active = index;
                     let chosen = file_dialog(frame)
                         .set_title("Save as")
-                        .set_file_name(tab.title())
+                        .set_file_name(tab.suggested_file_name())
                         .save_file();
                     let Some(path) = chosen else {
                         self.tabs[index].status = "Quit cancelled".into();
