@@ -6,6 +6,7 @@ use crate::{
 use eframe::egui::{
     self, Align, Align2, Button, Color32, Context, CursorIcon, Event, EventFilter, FontId, Galley,
     Id, ImeEvent, Key, KeyboardShortcut, Modifiers, Rect, ScrollArea, Sense, Ui, ViewportCommand,
+    epaint::TextOptions,
     pos2,
     text::{CCursor, LayoutJob, TextFormat},
     vec2,
@@ -36,6 +37,22 @@ struct Group {
 struct Scroll {
     position: usize,
     center: bool,
+}
+
+/// Cached galleys point into egui's font atlas, which egui rebuilds on new text options
+/// (dark and light themes differ), a new scale, or when it fills up.
+#[derive(Clone, Copy, PartialEq)]
+struct AtlasState {
+    options: TextOptions,
+    fill: f32,
+    scale: f32,
+}
+
+impl AtlasState {
+    /// The fill ratio only shrinks when the atlas is cleared.
+    fn rebuilt(&self, now: &Self) -> bool {
+        self.options != now.options || self.scale != now.scale || now.fill < self.fill
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -81,6 +98,7 @@ pub struct Editor {
     matches_version: u64,
     page_rows: usize,
     palette: &'static Palette,
+    atlas: Option<AtlasState>,
 }
 
 impl Default for Editor {
@@ -106,6 +124,7 @@ impl Default for Editor {
             matches_version: u64::MAX,
             page_rows: 20,
             palette: &theme::DARK,
+            atlas: None,
         }
     }
 }
@@ -797,11 +816,14 @@ impl Editor {
     }
 
     pub fn ui(&mut self, ui: &mut Ui, id: Id, request_focus: bool, palette: &'static Palette) {
-        if !std::ptr::eq(self.palette, palette) {
+        let ctx = ui.ctx().clone();
+        let atlas = Self::atlas_state(&ctx);
+        if !std::ptr::eq(self.palette, palette)
+            || self.atlas.is_some_and(|seen| seen.rebuilt(&atlas))
+        {
             self.palette = palette;
             self.layouts.clear();
         }
-        let ctx = ui.ctx().clone();
         let font = FontId::monospace(FONT_SIZE);
         let (row_height, char_width) =
             ctx.fonts_mut(|fonts| (fonts.row_height(&font), fonts.glyph_width(&font, 'M')));
@@ -1019,6 +1041,17 @@ impl Editor {
 
                 self.context_menu(&response, id);
             });
+        self.atlas = Some(Self::atlas_state(&ctx));
+    }
+
+    fn atlas_state(ctx: &Context) -> AtlasState {
+        let (options, fill) =
+            ctx.fonts_mut(|fonts| (*fonts.options(), fonts.font_atlas_fill_ratio()));
+        AtlasState {
+            options,
+            fill,
+            scale: ctx.pixels_per_point(),
+        }
     }
 
     fn context_menu(&mut self, response: &egui::Response, id: Id) {
@@ -1216,6 +1249,36 @@ mod tests {
         editor.replace(0..4, "<a>");
         assert_eq!(editor.state_at(1), State::Text);
         assert_eq!(editor.state_at(3), State::Text);
+    }
+
+    #[test]
+    fn cached_lines_are_laid_out_again_when_the_font_atlas_is_rebuilt() {
+        let ctx = Context::default();
+        let mut editor = editor("{\"a\": 1}");
+        let id = Id::unique("editor");
+        let frame = |editor: &mut Editor| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| editor.ui(ui, id, false, &theme::DARK))
+                .textures_delta
+                .clear();
+        };
+        let galley = |editor: &Editor| editor.layouts[&(0, 0)].galley.clone();
+        frame(&mut editor);
+        frame(&mut editor);
+        let before = galley(&editor);
+        frame(&mut editor);
+        assert!(
+            Arc::ptr_eq(&before, &galley(&editor)),
+            "unchanged atlas keeps the cache"
+        );
+        // Light visuals use other text options, so egui starts a new font atlas.
+        ctx.set_visuals(egui::Visuals::light());
+        frame(&mut editor);
+        frame(&mut editor);
+        assert!(!Arc::ptr_eq(&before, &galley(&editor)));
     }
 
     #[test]
