@@ -14,6 +14,12 @@ pub struct Settings {
     pub search_case_sensitive: bool,
     pub theme: String,
     pub decode_on_open: bool,
+    pub check_for_updates: bool,
+    /// Unix seconds of the last automatic or manual update check.
+    pub last_update_check: u64,
+    /// Newest version seen by any window, so the notice shows between daily checks.
+    pub latest_version: String,
+    pub skipped_version: String,
 }
 
 impl Default for Settings {
@@ -24,6 +30,10 @@ impl Default for Settings {
             search_case_sensitive: true,
             theme: "dark".into(),
             decode_on_open: false,
+            check_for_updates: true,
+            last_update_check: 0,
+            latest_version: String::new(),
+            skipped_version: String::new(),
         }
     }
 }

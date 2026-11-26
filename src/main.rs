@@ -11,6 +11,7 @@ mod theme;
 mod tree;
 mod tree_style;
 mod ui;
+mod update;
 
 use document::Kind;
 use single_instance::Launch;
